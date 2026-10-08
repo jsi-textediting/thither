@@ -22,7 +22,7 @@ endif()
 
 option(THITHER_STATIC "Link thither-server statically" OFF)
 option(THITHER_EMBED_LUA "Compile the Lua modules into thither-server" ON)
-set(THITHER_LITE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src" CACHE PATH
+set(THITHER_LITE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../lite-xl/src" CACHE PATH
     "Lite XL src/ directory with the shared system/process/dirmonitor/regex sources")
 set(THITHER_DIRMONITOR_BACKEND "" CACHE STRING
     "dirmonitor backend: inotify | fsevents | kqueue | dummy (auto when empty)")
