@@ -83,33 +83,39 @@ return function(server)
   -- write_commit | write_abort. Nothing becomes visible until write_commit.
   local writers, nwriters, next_wid = {}, 0, 1
 
-  ops.write_begin = function(a)
+  ops.write_begin = function(a, req)
     if nwriters >= MAX_WRITERS then raise("too_many", "too many open write sessions") end
     local path = server.path(a.path)
     local mode = a.mode ~= nil and int_arg(a.mode, "mode") or nil
     local w = unwrap(serverfs.writer(path, mode, a.create_dirs and true or false))
     local wid = next_wid
     next_wid = next_wid + 1
-    writers[wid] = { w = w, if_match = a.if_match }
+    local s = { w = w, if_match = a.if_match, conn = req and req.conn }
+    writers[wid] = s
+    if req and req.conn then req.conn.writers[wid] = s end
     nwriters = nwriters + 1
     return { wid = wid }
   end
 
-  local function get_writer(a)
+  local function get_writer(a, req)
     local s = writers[a.wid]
-    if not s then raise("no_stream", "unknown write session") end
+    if not s or (req and req.conn and s.conn and s.conn ~= req.conn) then
+      raise("no_stream", "unknown write session")
+    end
     return s
   end
 
   local function drop_writer(wid)
-    if writers[wid] then
+    local s = writers[wid]
+    if s then
+      if s.conn and s.conn.writers then s.conn.writers[wid] = nil end
       writers[wid] = nil
       nwriters = nwriters - 1
     end
   end
 
-  ops.write_chunk = function(a)
-    local s = get_writer(a)
+  ops.write_chunk = function(a, req)
+    local s = get_writer(a, req)
     local ok, code, msg = s.w:write(check_data(a.data))
     if not ok then
       s.w:abort()
@@ -119,14 +125,14 @@ return function(server)
     return s.w:size()
   end
 
-  ops.write_commit = function(a)
-    local s = get_writer(a)
+  ops.write_commit = function(a, req)
+    local s = get_writer(a, req)
     drop_writer(a.wid)
     return unwrap(s.w:commit(s.if_match))
   end
 
-  ops.write_abort = function(a)
-    local s = get_writer(a)
+  ops.write_abort = function(a, req)
+    local s = get_writer(a, req)
     s.w:abort()
     drop_writer(a.wid)
     return true
@@ -143,7 +149,8 @@ return function(server)
   ops.remove = function(a)
     local path = server.path(a.path, true)
     if path == "/" then raise("EINVAL", "refusing to remove the filesystem root") end
-    if server.root and path == server.root then raise("jail", "cannot remove the server root") end
+    local root = server.root_of()
+    if root and path == root then raise("jail", "cannot remove the server root") end
     unwrap(serverfs.remove(path, a.recursive and true or false))
     return true
   end
@@ -265,4 +272,18 @@ return function(server)
     end
     return b[1] or ""
   end
+
+  server.on_disconnect(function(conn)
+    local to_abort = {}
+    for wid, s in pairs(writers) do
+      if s.conn == conn then to_abort[#to_abort + 1] = wid end
+    end
+    for _, wid in ipairs(to_abort) do
+      local s = writers[wid]
+      if s then
+        s.w:abort()
+        drop_writer(wid)
+      end
+    end
+  end)
 end

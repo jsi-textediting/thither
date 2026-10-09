@@ -90,4 +90,13 @@ function Reader:next()
   return value
 end
 
+--- Returns remaining unparsed bytes in the buffer and clears it.
+function Reader:unread_bytes()
+  flatten(self)
+  local res = self.buf:sub(self.pos)
+  self.buf = ""
+  self.pos = 1
+  return res
+end
+
 return frame

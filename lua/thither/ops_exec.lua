@@ -59,25 +59,29 @@ return function(server)
     end
     local sid = next_sid
     next_sid = next_sid + 1
-    streams[sid] = {
-      id = sid, proc = proc, req_id = req.id,
+    local st = {
+      id = sid, proc = proc, req_id = req.id, conn = req.conn,
       credit = window == 0 and math.huge or window, window = window,
       inq = {}, inq_bytes = 0, close_stdin = false, stdin_closed = a.stdin == false,
       killed = false, idle = 0,
     }
+    streams[sid] = st
+    if req.conn then req.conn.streams[sid] = st end
     nstreams = nstreams + 1
     return { stream = sid, pid = proc:pid() }
   end
 
-  local function get_stream(a)
+  local function get_stream(a, req)
     local st = streams[a.stream]
-    if not st then raise("no_stream", "unknown or finished stream: " .. tostring(a.stream)) end
+    if not st or (req and req.conn and st.conn and st.conn ~= req.conn) then
+      raise("no_stream", "unknown or finished stream: " .. tostring(a.stream))
+    end
     return st
   end
 
   -- args: stream, data, close   (replies once the data is written to the child)
   ops.stdin = function(a, req)
-    local st = get_stream(a)
+    local st = get_stream(a, req)
     if st.stdin_closed or st.close_stdin then raise("stdin_closed", "stdin is closed") end
     local data = a.data
     if data ~= nil then
@@ -96,8 +100,8 @@ return function(server)
     return true
   end
 
-  ops.stdin_close = function(a)
-    local st = get_stream(a)
+  ops.stdin_close = function(a, req)
+    local st = get_stream(a, req)
     st.close_stdin = true
     return true
   end
@@ -105,8 +109,8 @@ return function(server)
   local signals = { term = "terminate", kill = "kill", int = "interrupt" }
 
   -- args: stream, signal ("term" (default) | "kill" | "int")
-  ops.kill = function(a)
-    local st = get_stream(a)
+  ops.kill = function(a, req)
+    local st = get_stream(a, req)
     local method = signals[a.signal or "term"]
     if not method then raise("bad_request", "signal must be term, kill or int") end
     st.killed = true
@@ -115,8 +119,8 @@ return function(server)
   end
 
   -- args: stream, n   (bytes consumed by the client)
-  ops.ack = function(a)
-    local st = streams[a.stream]
+  ops.ack = function(a, req)
+    local st = get_stream(a, req)
     if st and st.credit ~= math.huge then
       if math.type(a.n) ~= "integer" or a.n < 0 then raise("bad_request", "n must be a non-negative integer") end
       st.credit = math.min(st.credit + a.n, st.window)
@@ -124,9 +128,9 @@ return function(server)
     return true
   end
 
-  table.insert(server.cancel_hooks, function(id)
+  table.insert(server.cancel_hooks, function(id, conn)
     for _, st in pairs(streams) do
-      if st.req_id == id and st.req_id ~= nil then
+      if st.req_id == id and st.req_id ~= nil and (not conn or st.conn == conn) then
         st.killed = true
         st.proc:terminate()
       end
@@ -135,9 +139,9 @@ return function(server)
 
   -- once the client reuses the id of an exec request for a new request, a
   -- cancel of that id refers to the new request, not to the child
-  table.insert(server.start_hooks, function(id)
+  table.insert(server.start_hooks, function(id, conn)
     for _, st in pairs(streams) do
-      if st.req_id == id then st.req_id = nil end
+      if st.req_id == id and (not conn or st.conn == conn) then st.req_id = nil end
     end
   end)
 
@@ -179,7 +183,8 @@ return function(server)
       local data = st.proc:read(stream_id, n)
       if not data or data == "" then break end
       st.credit = st.credit - #data
-      server.send({ ev = which, stream = st.id, data = msgpack.bin(data) })
+      local msg = { ev = which, stream = st.id, data = msgpack.bin(data) }
+      if st.conn then st.conn:send(msg) else server.send(msg) end
       got = true
     end
     return got
@@ -187,9 +192,11 @@ return function(server)
 
   local function finished(st)
     streams[st.id] = nil
+    if st.conn and st.conn.streams then st.conn.streams[st.id] = nil end
     nstreams = nstreams - 1
     local code = st.proc:returncode()
-    server.send({ ev = "exit", stream = st.id, code = code or -1, killed = st.killed })
+    local msg = { ev = "exit", stream = st.id, code = code or -1, killed = st.killed }
+    if st.conn then st.conn:send(msg) else server.send(msg) end
   end
 
   table.insert(server.tickers, function()
@@ -211,6 +218,17 @@ return function(server)
       if h < hint then hint = h end
     end
     return hint
+  end)
+
+  server.on_disconnect(function(conn)
+    for sid, st in pairs(streams) do
+      if st.conn == conn then
+        pcall(st.proc.kill, st.proc)
+        streams[sid] = nil
+        if conn.streams then conn.streams[sid] = nil end
+        nstreams = nstreams - 1
+      end
+    end
   end)
 
   table.insert(server.hooks.on_shutdown, function()

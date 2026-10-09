@@ -15,7 +15,7 @@ package.path = dir .. "/?.lua;" .. package.path
 local H = require "harness"
 
 local filter = arg and arg[1]
-for _, name in ipairs({ "test_msgpack", "test_frame", "test_paths", "test_server", "test_fs", "test_exec_watch", "test_large", "test_embed", "test_copies" }) do
+for _, name in ipairs({ "test_msgpack", "test_frame", "test_paths", "test_server", "test_conn", "test_serverio", "test_pty", "test_session", "test_fs", "test_exec_watch", "test_large", "test_embed", "test_copies" }) do
   dofile(dir .. "/" .. name .. ".lua")
 end
 
