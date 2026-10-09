@@ -9,7 +9,9 @@
 --   local server = require "thither"
 --   server.register("greeter", { hello = function(args, req) return "hi " .. args.name end })
 --   server.on_start(function(ctx) end)        -- ctx: root, home, userdir, version
---   server.on_root(function(path) end)        -- the client declared its project root
+--   server.on_root(function(path, conn) end)  -- a client declared its project root (realpath;
+--                                             -- conn: that connection, conn.project_root == path)
+--   server.on_connect(function(conn) end) / server.on_disconnect(function(conn) end)
 --   server.on_shutdown(function() end)
 --   server.notify("progress", { done = 3 })   -- pushes { ev = "notify", name, data }
 --

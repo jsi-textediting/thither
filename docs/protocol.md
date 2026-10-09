@@ -187,7 +187,7 @@ Symlinks are followed (the table describes the target and carries
 | `ping` | `data` (any) | `data` (or `true`) |
 | `info` | - | the hello reply fields |
 | `home` | - | home directory string |
-| `set_root` | `path` | `true`; tells server plugins the project root (`on_root`) |
+| `set_root` | `path` | `true`; records this connection's project root (the realpath of `path`, which must be an existing directory, inside the jail when there is one; `info.project_root`) and tells server plugins (`on_root(path, conn)`). It is not a jail: only `--root` (the server's or a relay's) confines a connection. Errors `ENOENT`, `ENOTDIR`, `jail`. |
 | `stat` | `path`, `nofollow` | stat table; errors `ENOENT`, ... |
 | `readdir` | `path`, `offset=0`, `limit=20000` (max 50000) | `{entries={stat tables with name, sorted by name in byte order}, total=<entries in the directory>, offset, more=<bool>}`. Only the requested slice is stat'ed. `.` and `..` are omitted. A slice that would not fit in one frame (long names or symlink targets) is cut short: fewer than `limit` entries with `more=true`; continue at `offset + #entries`. |
 | `read` | `path`, `offset=0`, `len` (<= 8 MiB), `etag` (optional) | `{data=<bin>, etag, eof=<bool>}`; `stale` if `etag` no longer matches. A short result means end of file. |
@@ -444,7 +444,7 @@ server.register("greeter", {                       -- service name, then methods
   end,
 })
 server.on_start(function(ctx) end)     -- ctx: root, home, userdir, version, proto_version
-server.on_root(function(path) end)     -- the client sent set_root
+server.on_root(function(path, conn) end) -- the client sent set_root (path: realpath; conn: its connection)
 server.on_shutdown(function() end)     -- connection closed / server exiting
 server.notify("progress", { n = 3 })   -- pushes { ev="notify", name="progress", data={n=3} }
 server.log("text %s", x)               -- to the --log file
@@ -473,6 +473,22 @@ thither-server --extract-data <dir>                             -- write the bui
 ```
 
 * `--stdio` is the only transport (and the default).
+* `--session <name>` runs a relay that copies stdio to a per-user session
+  daemon (started on demand, `session` cap), see `docs/sessions-plan.md`.
+  * The relay's first frame (`ev="relay"`: `env` a map of strings, `opts`
+    with an optional `root`) is validated; a bad one is answered with
+    `relay_ok` carrying `err={code,msg}` and that connection is closed (the
+    relay forwards it to the client as an error hello and exits 2). A
+    preamble root is resolved like `set_root`.
+  * On stdin EOF the relay still sends what it read and forwards the
+    daemon's output for up to 1 s of quiet (10 s at most), then exits 0.
+  * `--kill` gives up (exit 1) after 5 s without an answer.
+  * The runtime and state directories must be ours, mode `0700` and not
+    symlinks; an existing one with another mode is refused, not chmod'ed. The
+    socket path must be absent or a socket of ours. The `agent.sock` link
+    only points at an `SSH_AUTH_SOCK` that is a socket owned by us.
+  * On shutdown the daemon sends `session_closing` and drains pending output
+    for up to `timeout_ms` of `session_shutdown` (default 2000 ms).
 * `--root <dir>` jails all non-exec file ops to the realpath of `<dir>`.
 * `--log <file>` appends a request log.
 * **Single file.** The server's Lua modules (`lua/thither/*.lua`) are compiled

@@ -40,51 +40,118 @@ static int parse_signal(const char *name) {
   return -1;
 }
 
-/* serverpty.open({ argv, cwd, env, cols, rows, term }) -> { master = fd, pid = n } | nil, err */
+static size_t env_name_len(const char *e) {
+  const char *eq = strchr(e, '=');
+  return eq ? (size_t) (eq - e) : strlen(e);
+}
+
+static int env_same_name(const char *a, const char *b) {
+  size_t la = env_name_len(a);
+  return la == env_name_len(b) && memcmp(a, b, la) == 0;
+}
+
+/* Builds the child's environment in GC-owned memory: environ, overridden by
+** TERM and then by the opts.env entries (table at `env_idx`, or 0). Entries are
+** { NAME = "value" } (string key; string or number value) or array-style
+** "NAME=value" strings; anything else is ignored. */
+static char **build_env(lua_State *L, int env_idx, int anchor, const char *term) {
+  int nenv = 0;
+  if (env_idx) {
+    lua_pushnil(L);
+    while (lua_next(L, env_idx) != 0) { nenv++; lua_pop(L, 1); }
+  }
+  const char **over = lua_newuserdatauv(L, (size_t) (nenv + 1) * sizeof(char *), 0);
+  lua_rawseti(L, anchor, (lua_Integer) lua_rawlen(L, anchor) + 1);
+  int nover = 0;
+  lua_pushfstring(L, "TERM=%s", term);
+  over[nover++] = server_anchor_string(L, anchor);
+  if (env_idx) {
+    lua_pushnil(L);
+    while (lua_next(L, env_idx) != 0) {
+      int kt = lua_type(L, -2), vt = lua_type(L, -1);
+      if (kt == LUA_TSTRING && (vt == LUA_TSTRING || vt == LUA_TNUMBER)) {
+        const char *k = lua_tostring(L, -2);
+        if (*k && !strchr(k, '=')) {
+          lua_pushfstring(L, "%s=%s", k, lua_tostring(L, -1)); /* converts the value only */
+          over[nover++] = server_anchor_string(L, anchor);
+        }
+      } else if (kt == LUA_TNUMBER && vt == LUA_TSTRING) {
+        const char *e = lua_tostring(L, -1);
+        if (e[0] != '=' && strchr(e, '=')) {
+          lua_pushvalue(L, -1);
+          over[nover++] = server_anchor_string(L, anchor);
+        }
+      }
+      lua_pop(L, 1);
+    }
+  }
+  int nsys = 0;
+  for (char **e = environ; e && *e; e++) nsys++;
+  char **envp = lua_newuserdatauv(L, (size_t) (nsys + nover + 1) * sizeof(char *), 0);
+  lua_rawseti(L, anchor, (lua_Integer) lua_rawlen(L, anchor) + 1);
+  int n = 0;
+  for (int i = 0; i < nsys; i++) {
+    int overridden = 0;
+    for (int j = 0; j < nover && !overridden; j++) overridden = env_same_name(environ[i], over[j]);
+    if (!overridden) envp[n++] = environ[i];
+  }
+  for (int i = 0; i < nover; i++) {
+    int later = 0; /* the last of duplicate names wins */
+    for (int j = i + 1; j < nover && !later; j++) later = env_same_name(over[i], over[j]);
+    if (!later) envp[n++] = (char *) over[i];
+  }
+  envp[n] = NULL;
+  return envp;
+}
+
+/* serverpty.open({ argv, cwd, env, cols, rows, term })
+**   -> { master = fd, pid = n } | nil, message, code
+** argv[1] is looked up in PATH. When the child cannot start (no such program,
+** bad cwd, ...) the errno is passed back through a close-on-exec pipe:
+** message is strerror(), code its errno name ("ENOENT", ...). The child gets
+** default signal dispositions and an empty signal mask. */
 static int f_pty_open(lua_State *L) {
   luaL_checktype(L, 1, LUA_TTABLE);
+  lua_settop(L, 1);
+  /* every string the child needs is anchored here and the arrays are
+  ** userdata: a Lua error while collecting the options leaks nothing */
+  lua_newtable(L); /* 2: anchors */
+  const int anchor = 2;
 
   /* Extract argv */
   lua_getfield(L, 1, "argv");
   if (!lua_istable(L, -1)) {
-    lua_pop(L, 1);
     lua_pushnil(L);
     lua_pushliteral(L, "argv must be a list of strings");
     return 2;
   }
   int argc = (int) lua_rawlen(L, -1);
   if (argc == 0) {
-    lua_pop(L, 1);
     lua_pushnil(L);
     lua_pushliteral(L, "argv cannot be empty");
     return 2;
   }
-  char **c_argv = malloc((argc + 1) * sizeof(char *));
-  if (!c_argv) {
-    lua_pop(L, 1);
-    lua_pushnil(L);
-    lua_pushliteral(L, "out of memory");
-    return 2;
-  }
+  char **c_argv = lua_newuserdatauv(L, (size_t) (argc + 1) * sizeof(char *), 0);
+  lua_rawseti(L, anchor, (lua_Integer) lua_rawlen(L, anchor) + 1);
   for (int i = 0; i < argc; i++) {
     lua_rawgeti(L, -1, i + 1);
-    c_argv[i] = strdup(luaL_checkstring(L, -1));
-    lua_pop(L, 1);
+    if (!lua_isstring(L, -1))
+      return luaL_error(L, "serverpty.open: argv[%d] must be a string", i + 1);
+    c_argv[i] = (char *) server_anchor_string(L, anchor);
   }
   c_argv[argc] = NULL;
   lua_pop(L, 1); /* pop argv */
 
   /* Optional cwd */
   lua_getfield(L, 1, "cwd");
-  const char *c_cwd = lua_isstring(L, -1) ? lua_tostring(L, -1) : NULL;
-  char *cwd = c_cwd ? strdup(c_cwd) : NULL;
-  lua_pop(L, 1);
+  const char *cwd = NULL;
+  if (lua_isstring(L, -1)) cwd = server_anchor_string(L, anchor);
+  else lua_pop(L, 1);
 
   /* Optional term */
   lua_getfield(L, 1, "term");
-  const char *c_term = lua_isstring(L, -1) ? lua_tostring(L, -1) : "xterm-256color";
-  char *term = strdup(c_term);
-  lua_pop(L, 1);
+  if (!lua_isstring(L, -1)) { lua_pop(L, 1); lua_pushliteral(L, "xterm-256color"); }
+  const char *term = server_anchor_string(L, anchor);
 
   /* Optional cols and rows */
   lua_getfield(L, 1, "cols");
@@ -94,54 +161,21 @@ static int f_pty_open(lua_State *L) {
   int rows = (int) luaL_optinteger(L, -1, 24);
   lua_pop(L, 1);
 
-  /* Optional env */
-  char **c_env = NULL;
+  /* Optional env, merged into a complete environment for the child */
   lua_getfield(L, 1, "env");
-  if (lua_istable(L, -1)) {
-    int env_count = 0;
-    lua_pushnil(L);
-    while (lua_next(L, -2) != 0) {
-      env_count++;
-      lua_pop(L, 1);
-    }
-    c_env = malloc((env_count + 2) * sizeof(char *));
-    if (c_env) {
-      int idx = 0;
-      lua_pushnil(L);
-      while (lua_next(L, -2) != 0) {
-        if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
-          const char *k = lua_tostring(L, -2);
-          const char *v = lua_tostring(L, -1);
-          size_t blen = strlen(k) + strlen(v) + 2;
-          char *entry = malloc(blen);
-          if (entry) {
-            snprintf(entry, blen, "%s=%s", k, v);
-            c_env[idx++] = entry;
-          }
-        }
-        lua_pop(L, 1);
-      }
-      c_env[idx] = NULL;
-    }
-  }
+  int env_idx = lua_istable(L, -1) ? lua_gettop(L) : 0;
+  char **c_env = build_env(L, env_idx, anchor, term);
   lua_pop(L, 1); /* pop env */
 
   /* Open master PTY */
   int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (master < 0) {
-    int err = errno;
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
-    return push_err(L, err);
+    return push_err(L, errno);
   }
 
   if (grantpt(master) != 0 || unlockpt(master) != 0) {
     int err = errno;
     close(master);
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
     return push_err(L, err);
   }
 
@@ -154,9 +188,6 @@ static int f_pty_open(lua_State *L) {
     int err = errno;
     pthread_mutex_unlock(&pts_lock);
     close(master);
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
     return push_err(L, err);
   }
   strncpy(slavename, pts, sizeof(slavename) - 1);
@@ -166,9 +197,6 @@ static int f_pty_open(lua_State *L) {
   if (ptsname_r(master, slavename, sizeof(slavename)) != 0) {
     int err = errno;
     close(master);
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
     return push_err(L, err);
   }
 #endif
@@ -181,15 +209,14 @@ static int f_pty_open(lua_State *L) {
 #endif
     int err = errno;
     close(master);
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
     return push_err(L, err);
   }
 #if !defined(__linux__) || !defined(O_CLOEXEC)
   fcntl(errpipe[0], F_SETFD, FD_CLOEXEC);
   fcntl(errpipe[1], F_SETFD, FD_CLOEXEC);
 #endif
+  /* the child dup2()s the slave over 0..2 and keeps errpipe[1] */
+  errpipe[1] = server_fd_above_stdio(errpipe[1]);
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -197,14 +224,12 @@ static int f_pty_open(lua_State *L) {
     close(master);
     close(errpipe[0]);
     close(errpipe[1]);
-    for (int i = 0; i < argc; i++) free(c_argv[i]);
-    free(c_argv); free(cwd); free(term);
-    if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
     return push_err(L, err);
   }
 
   if (pid == 0) {
-    /* Child process */
+    /* Child process: only async-signal-safe calls until exec */
+    server_child_reset_signals();
     close(master);
     close(errpipe[0]);
 
@@ -246,21 +271,10 @@ static int f_pty_open(lua_State *L) {
       _exit(127);
     }
 
-    setenv("TERM", term ? term : "xterm-256color", 1);
-    if (c_env) {
-      for (int i = 0; c_env[i]; i++) {
-        putenv(c_env[i]);
-      }
-    }
+    /* errpipe[1] stays open (it is close-on-exec) to report exec failures */
+    server_close_fds_from(3, errpipe[1]);
 
-#if defined(__linux__) && defined(SYS_close_range)
-    syscall(SYS_close_range, 3, ~0U, 0);
-#else
-    for (int fd = 3; fd < 1024; fd++) {
-      if (fd != errpipe[1]) close(fd);
-    }
-#endif
-
+    environ = c_env; /* execvp searches the child's PATH */
     execvp(c_argv[0], c_argv);
     int e = errno;
     ssize_t w = write(errpipe[1], &e, sizeof(e)); (void) w;
@@ -270,19 +284,17 @@ static int f_pty_open(lua_State *L) {
   /* Parent process */
   close(errpipe[1]);
   int child_err = 0;
-  ssize_t nr = read(errpipe[0], &child_err, sizeof(child_err));
+  ssize_t nr;
+  do nr = read(errpipe[0], &child_err, sizeof(child_err)); while (nr < 0 && errno == EINTR);
   close(errpipe[0]);
-
-  for (int i = 0; i < argc; i++) free(c_argv[i]);
-  free(c_argv); free(cwd); free(term);
-  if (c_env) { for (int i = 0; c_env[i]; i++) free(c_env[i]); free(c_env); }
 
   if (nr > 0) {
     close(master);
-    waitpid(pid, NULL, 0);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
     lua_pushnil(L);
     lua_pushstring(L, strerror(child_err));
-    return 2;
+    lua_pushstring(L, server_errno_name(child_err));
+    return 3;
   }
 
   /* Set master PTY descriptor to non-blocking */

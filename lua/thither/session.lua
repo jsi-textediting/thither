@@ -11,25 +11,60 @@ function session.validate_name(name)
   return name
 end
 
+--- Makes sure `dir` is a private directory: not a symlink (lstat), owned by
+--- us, mode 0700. A missing directory is created (with its parents); only a
+--- directory created here may be chmod'ed (the umask may have narrowed the
+--- mode), an existing one with the wrong owner or mode is refused.
 function session.verify_dir(dir)
-  serverfs.mkdir(dir, 448, true)
-  local st = serverfs.stat(dir, true)
-  if not st or st.type ~= "dir" or st.is_link then
-    return nil, "directory is invalid or a symlink: " .. tostring(dir)
-  end
   local uid = serverfs.ids().uid
+  local st = serverfs.stat(dir, true)
+  local created = false
+  if not st then
+    local ok, code, msg = serverfs.mkdir(dir, 448, true)
+    if not ok and code ~= "EEXIST" then
+      return nil, string.format("cannot create directory %s: %s", tostring(dir), tostring(msg or code))
+    end
+    created = ok and true or false
+    st = serverfs.stat(dir, true)
+    if not st then
+      return nil, "cannot stat directory: " .. tostring(dir)
+    end
+  end
+  if st.type ~= "dir" or st.is_link then
+    return nil, "not a directory, or a symlink: " .. tostring(dir)
+  end
   if st.uid ~= uid then
     return nil, string.format("directory not owned by current user (owner %s, expected %s): %s",
       tostring(st.uid), tostring(uid), tostring(dir))
   end
   if (st.mode % 512) ~= 448 then
-    serverfs.chmod(dir, 448)
-    st = serverfs.stat(dir, true)
-    if (st.mode % 512) ~= 448 then
-      return nil, "directory mode is not 0700: " .. tostring(dir)
+    if created then
+      serverfs.chmod(dir, 448)
+      st = serverfs.stat(dir, true)
+    end
+    if not st or (st.mode % 512) ~= 448 then
+      return nil, string.format("directory mode is %03o, not 0700 (fix with chmod 700): %s",
+        st and (st.mode % 512) or 0, tostring(dir))
     end
   end
   return true
+end
+
+--- Checks the socket path before it is connected to or removed: nothing
+--- there (true, "absent"), or a unix socket owned by us (true, "socket").
+--- Anything else (a symlink, a regular file, someone else's socket) is
+--- refused: nil, message. serverfs.stat reports sockets as "socket" or, in
+--- builds that do not distinguish them, "other".
+function session.check_socket(path)
+  local st = serverfs.stat(path, true)
+  if not st then return true, "absent" end
+  if st.is_link or (st.type ~= "socket" and st.type ~= "other") then
+    return nil, "not a socket: " .. tostring(path)
+  end
+  if st.uid ~= serverfs.ids().uid then
+    return nil, string.format("socket not owned by current user (owner %s): %s", tostring(st.uid), tostring(path))
+  end
+  return true, "socket"
 end
 
 function session.runtime_dir()

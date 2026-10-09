@@ -119,8 +119,11 @@ H.test("session: dynamic SSH_AUTH_SOCK agent.sock symlink", function()
   local sname = "sess_agent_" .. tostring(system.get_process_id())
   local sock1 = "/tmp/thither_fake_agent1_" .. tostring(system.get_process_id()) .. ".sock"
   local sock2 = "/tmp/thither_fake_agent2_" .. tostring(system.get_process_id()) .. ".sock"
-  U.write_file(sock1, "agent1")
-  U.write_file(sock2, "agent2")
+  local notsock = "/tmp/thither_fake_agent3_" .. tostring(system.get_process_id()) .. ".sock"
+  -- the link may only point at sockets owned by us: real listening sockets
+  local lfd1 = assert(serverio.listen(sock1))
+  local lfd2 = assert(serverio.listen(sock2))
+  U.write_file(notsock, "not a socket")
 
   local c1, rep1 = Client.connect({
     args = { "--session", sname },
@@ -151,10 +154,23 @@ H.test("session: dynamic SSH_AUTH_SOCK agent.sock symlink", function()
   H.ok(st and st.is_link)
   H.eq(st.link, sock1, "agent.sock should revert to remaining c1 agent socket")
 
+  -- a relay whose SSH_AUTH_SOCK is not a socket does not move the link
+  local c3 = Client.connect({
+    args = { "--session", sname },
+    env = { SSH_AUTH_SOCK = notsock },
+  })
+  st = serverfs.stat(agent_link, true)
+  H.ok(st and st.is_link)
+  H.eq(st.link, sock1, "a regular file is never the agent socket")
+  c3:close()
+
   c1:request("session_shutdown")
   c1:close()
+  serverio.close(lfd1)
+  serverio.close(lfd2)
   os.remove(sock1)
   os.remove(sock2)
+  os.remove(notsock)
 end)
 
 H.test("session: CLI --kill terminates daemon", function()
@@ -194,14 +210,21 @@ end)
 
 H.test("session: idle exit timer", function()
   local sname = "sess_idle_" .. tostring(system.get_process_id())
-  local c, rep = Client.connect({ args = { "--session", sname, "--idle-exit", "1" } })
+  local agent = "/tmp/thither_idle_agent_" .. tostring(system.get_process_id()) .. ".sock"
+  local afd = assert(serverio.listen(agent))
+  os.remove(session.daemon_log(assert(session.state_dir(sname))))
+  local c, rep = Client.connect({ args = { "--session", sname, "--idle-exit", "1" },
+                                  env = { SSH_AUTH_SOCK = agent } })
   local daemon_pid = rep.session.daemon_pid
+  local statedir = assert(session.state_dir(sname))
+  local sock_path = assert(session.socket_path(assert(session.runtime_dir()), sname))
+  H.ok(serverfs.stat(session.agent_link(statedir), true), "agent link while attached")
 
   H.eq(c:request("ping"), true)
   c:close()
 
   -- Wait for 1 second idle exit + small buffer
-  local deadline = system.get_time() + 3
+  local deadline = system.get_time() + 5
   local dead = false
   while system.get_time() < deadline do
     local _, kcode = U.sh("kill -0 " .. daemon_pid)
@@ -209,4 +232,293 @@ H.test("session: idle exit timer", function()
     system.sleep(0.1)
   end
   H.ok(dead, "daemon should exit after idle timeout expires")
+  -- a clean shutdown, not a crash: the socket and the agent link are gone and
+  -- the log has the idle line and the final one
+  H.ok(serverfs.stat(sock_path, true) == nil, "socket removed")
+  H.ok(serverfs.stat(session.agent_link(statedir), true) == nil, "agent link removed")
+  local log = U.read_file(session.daemon_log(statedir)) or ""
+  H.ok(log:find("idle timeout reached", 1, true), "idle exit logged:\n" .. log)
+  H.ok(log:find("daemon exited cleanly", 1, true), "clean exit logged:\n" .. log)
+  serverio.close(afd)
+  os.remove(agent)
 end)
+
+---------------------------------------------------------------------------
+-- review fixes (2026-10-09): preamble validation, roots, relay I/O, --kill,
+-- directory and socket checks, start-up races
+---------------------------------------------------------------------------
+
+local frame = require "thither.frame"
+
+local function sname_of(tag) return "s_" .. tag .. "_" .. tostring(system.get_process_id()) end
+
+local function sock_of(sname)
+  return assert(session.socket_path(assert(session.runtime_dir()), sname))
+end
+
+local function alive(pid)
+  local _, k = U.sh("kill -0 " .. pid)
+  return k == 0
+end
+
+local function wait_dead(pid, secs)
+  local deadline = system.get_time() + (secs or 3)
+  while system.get_time() < deadline do
+    if not alive(pid) then return true end
+    system.sleep(0.05)
+  end
+  return false
+end
+
+local function shutdown(c, pid)
+  c:request("session_shutdown")
+  c:close()
+  if pid then H.ok(wait_dead(pid), "daemon did not exit") end
+end
+
+--- Sends a relay preamble straight to the daemon's socket and returns the
+--- first frame it answers with (nil on EOF / timeout).
+local function raw_preamble(sock_path, pre)
+  local fd = assert(serverio.connect(sock_path))
+  pre.ev = "relay"
+  assert(serverio.write_blocking(frame.encode(pre), 2000, fd))
+  local r = frame.reader()
+  local deadline = system.get_time() + 5
+  local msg
+  while not msg and system.get_time() < deadline do
+    local p = serverio.poll({ [fd] = "r" }, 100)
+    if p and p[fd] then
+      local d = serverio.read(65536, fd)
+      if d == nil then break end
+      if #d > 0 then r:feed(d) end
+      msg = r:next()
+    end
+  end
+  serverio.close(fd)
+  return msg
+end
+
+-- CPU ticks (utime + stime) of a process from /proc, nil without it
+local CLK_TCK = tonumber((U.sh("getconf CLK_TCK")):match("%d+")) or 100
+local function ticks_of(pid)
+  local stat = U.read_file("/proc/" .. pid .. "/stat")
+  if not stat then return nil end
+  local fields = {}
+  for x in stat:match("%)%s+(.*)$"):gmatch("%S+") do fields[#fields + 1] = x end
+  return tonumber(fields[12]) + tonumber(fields[13])
+end
+
+H.test("session: a bad relay preamble is refused, the daemon survives", function()
+  local dir = U.tmpdir("badpre")
+  local root = dir .. "/root"
+  U.sh("mkdir -p " .. U.shq(root .. "/sub") .. " " .. U.shq(dir .. "/outside")
+    .. " && ln -s " .. U.shq(dir .. "/outside") .. " " .. U.shq(root .. "/escape")
+    .. " && echo x > " .. U.shq(root .. "/file"))
+  local sname = sname_of("badpre")
+  local c, rep = Client.connect({ args = { "--session", sname, "--root", root } })
+  local pid = rep.session.daemon_pid
+  local sock = sock_of(sname)
+  for _, case in ipairs({
+    { "symlink root pointing out of the jail", { opts = { root = root .. "/escape" } }, "jail" },
+    { "relative root", { opts = { root = "sub" } }, "bad_path" },
+    { "root outside the jail", { opts = { root = dir .. "/outside" } }, "jail" },
+    { "missing root", { opts = { root = root .. "/nope" } }, "ENOENT" },
+    { "root that is a file", { opts = { root = root .. "/file" } }, "ENOTDIR" },
+    { "non-table env", { env = "SSH_AUTH_SOCK=x" }, "bad_request" },
+    { "non-string env value", { env = { TERM = 1 } }, "bad_request" },
+    { "non-table opts", { opts = "x" }, "bad_request" },
+    { "non-string root", { opts = { root = 5 } }, "bad_request" },
+  }) do
+    local m = raw_preamble(sock, case[2])
+    H.ok(m and m.ev == "relay_ok" and m.err, case[1] .. ": expected an error relay_ok")
+    H.eq(m.err.code, case[3], case[1])
+    H.ok(alive(pid), case[1] .. ": the daemon died")
+  end
+  -- through a real relay: the client gets an error hello, the relay exits 2
+  local bad = Client.spawn({ args = { "--session", sname, "--root", dir .. "/outside" } })
+  local hello = bad:hello()
+  H.ok(hello and hello.ev == "hello" and hello.err, "error hello from a refused relay")
+  H.eq(hello.err.code, "jail")
+  H.eq(bad:wait_exit(5), 2)
+  -- a good relay still works, on the same daemon
+  local c2, rep2 = Client.connect({ args = { "--session", sname, "--root", root .. "/sub" } })
+  H.eq(rep2.session.daemon_pid, pid)
+  H.eq(c2:request("ping", { data = "ok" }), "ok")
+  H.eq(c2:request("info").root, serverfs.realpath(root .. "/sub"))
+  H.eq(c:request("ping", { data = "still" }), "still")
+  c2:close()
+  shutdown(c, pid)
+end)
+
+--- Port of the --root jail rules for a connection whose root is `spelled`
+--- (a path through a symlink) and resolves to `real`.
+local function check_symlinked_root(c, dir, spelled, real)
+  H.eq(c:request("stat", { path = spelled .. "/sub/a.txt" }).size, 5, "via the symlink spelling")
+  H.eq(c:request("stat", { path = real .. "/sub/a.txt" }).size, 5, "via the real path")
+  H.ok(c:request("write", { path = spelled .. "/new.txt", data = "n" }))
+  H.eq(U.read_file(real .. "/new.txt"), "n")
+  local _, err = c:request("stat", { path = dir .. "/outside/s.txt" })
+  H.eq(err and err.code, "jail", "outside the root")
+  _, err = c:request("read", { path = spelled .. "/escape/s.txt", offset = 0, len = 10 })
+  H.eq(err and err.code, "jail", "symlink escape")
+  for _, p in ipairs({ spelled, real, spelled .. "/sub/..", real .. "/sub/..", spelled .. "/" }) do
+    local _, rerr = c:request("remove", { path = p, recursive = true })
+    H.eq(rerr and rerr.code, "jail", "remove of the root as " .. p)
+  end
+  H.ok(U.exists(real .. "/sub/a.txt"), "the root is still there")
+  -- nofollow: a link in the root that points outside can be stat'ed and removed
+  H.eq(c:request("stat", { path = spelled .. "/escape", nofollow = true }).type, "symlink")
+  _, err = c:request("stat", { path = spelled .. "/escape/s.txt", nofollow = true })
+  H.eq(err and err.code, "jail", "only the last component may be a link out")
+  H.ok(c:request("remove", { path = spelled .. "/escape/", recursive = true }))
+  H.ok(not U.exists(real .. "/escape"), "link removed")
+  H.eq(U.read_file(dir .. "/outside/s.txt"), "secret\n", "the target is untouched")
+end
+
+local function symlinked_tree(tag)
+  local dir = U.tmpdir(tag)
+  U.sh("mkdir -p " .. U.shq(dir .. "/real/proj/sub") .. " " .. U.shq(dir .. "/outside")
+    .. " && echo secret > " .. U.shq(dir .. "/outside/s.txt")
+    .. " && ln -s real " .. U.shq(dir .. "/link")
+    .. " && ln -s " .. U.shq(dir .. "/outside") .. " " .. U.shq(dir .. "/real/proj/escape"))
+  U.write_file(dir .. "/real/proj/sub/a.txt", "hello")
+  return dir, dir .. "/link/proj", serverfs.realpath(dir .. "/real/proj")
+end
+
+H.test("session: set_root records a per-connection project root and does not jail", function()
+  local dir, spelled, real = symlinked_tree("sroot")
+  local sname = sname_of("setroot")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c2 = Client.connect({ args = { "--session", sname } })
+  H.ok(c:request("set_root", { path = spelled }))
+  local info = c:request("info")
+  H.eq(info.project_root, real, "the project root is stored as its realpath")
+  H.eq(info.root, nil, "set_root is not a jail")
+  H.eq(c:request("stat", { path = dir .. "/outside/s.txt" }).type, "file", "outside the project is reachable")
+  H.eq(c2:request("info").project_root, nil, "the other connection has its own project root")
+  -- set_root to a missing directory is an error, the old project root stays
+  local _, err = c:request("set_root", { path = real .. "/missing" })
+  H.eq(err and err.code, "ENOENT")
+  H.eq(c:request("info").project_root, real)
+  c2:close()
+  shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: --root through a symlink (preamble and daemon root)", function()
+  local dir, spelled, real = symlinked_tree("proot")
+  local sname = sname_of("symroot")
+  local c, rep = Client.connect({ args = { "--session", sname, "--root", spelled } })
+  H.eq(rep.root, real)
+  check_symlinked_root(c, dir, spelled, real)
+  shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: an attached idle relay does not spin", function()
+  local sname = sname_of("relaycpu")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  local rpid = c.proc:pid()
+  if not ticks_of(rpid) then shutdown(c) print("     (skipped: no /proc)") return end
+  H.eq(c:request("ping"), true)
+  local a = ticks_of(rpid)
+  local da = ticks_of(rep.session.daemon_pid)
+  system.sleep(2)
+  local used, dused = ticks_of(rpid) - a, ticks_of(rep.session.daemon_pid) - da
+  H.ok(used < CLK_TCK // 10, string.format("relay used %d ticks in 2 s while idle", used))
+  H.ok(dused < CLK_TCK // 10, string.format("daemon used %d ticks in 2 s while idle", dused))
+  shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: relay stdin EOF still delivers the replies in flight", function()
+  local sname = sname_of("relayeof")
+  local c0, rep = Client.connect({ args = { "--session", sname } })
+  local c = Client.spawn({ args = { "--session", sname } })
+  c:send({ ev = "hello", proto_version = 1, client_version = "tests", caps = {} })
+  c:send({ id = 1, op = "ping", args = { data = "late" } })
+  c.proc:close_stream(process.STREAM_STDIN)
+  H.eq(c:wait_exit(5), 0, "relay exit status")
+  local hello, pong = c:recv(1), c:recv(1)
+  H.ok(hello and hello.ev == "hello", "hello reply")
+  H.ok(pong and pong.id == 1 and pong.ok == "late", "ping reply after stdin EOF")
+  shutdown(c0, rep.session.daemon_pid)
+end)
+
+H.test("session: --kill gives up on a daemon that does not answer", function()
+  local datadir_arg = DATADIR and (" --datadir " .. U.shq(DATADIR)) or ""
+  local kill = U.shq(EXEFILE) .. datadir_arg .. " --session "
+  -- absent
+  local t0 = system.get_time()
+  local _, code = U.sh(kill .. sname_of("killnone") .. " --kill")
+  H.eq(code, 0, "--kill of a session that is not running")
+  H.ok(system.get_time() - t0 < 3, "absent: quick")
+  -- stuck: something listens on the socket but never answers
+  local sname = sname_of("killstuck")
+  local sock = sock_of(sname)
+  local lfd = assert(serverio.listen(sock))
+  t0 = system.get_time()
+  local out
+  out, code = U.sh(kill .. sname .. " --kill")
+  local took = system.get_time() - t0
+  serverio.close(lfd)
+  os.remove(sock)
+  H.ok(code ~= 0, "--kill of a stuck daemon fails: " .. out)
+  H.ok(took < 8, string.format("--kill took %.1f s", took))
+end)
+
+H.test("session: verify_dir refuses a directory with the wrong mode", function()
+  local base = U.tmpdir("vdir")
+  local d = base .. "/open"
+  U.sh("mkdir " .. U.shq(d) .. " && chmod 755 " .. U.shq(d))
+  local ok, err = session.verify_dir(d)
+  H.ok(not ok and err:find("0700", 1, true), "0755 dir accepted: " .. tostring(err))
+  H.eq(serverfs.stat(d, true).mode, 493, "and left alone (no chmod)")
+  -- a directory created by verify_dir is fine, also with a narrow umask
+  H.ok(session.verify_dir(base .. "/new/deeper"))
+  H.eq(serverfs.stat(base .. "/new/deeper", true).mode, 448)
+  -- a file is not a directory
+  U.write_file(base .. "/file", "x")
+  H.ok(not session.verify_dir(base .. "/file"))
+end)
+
+H.test("session: a stale socket is recovered, a non-socket is refused", function()
+  local sname = sname_of("stale")
+  local sock = sock_of(sname)
+  -- a socket file nobody listens on any more
+  serverio.close(assert(serverio.listen(sock)))
+  H.ok(serverfs.stat(sock, true), "stale socket file in place")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  H.eq(c:request("ping", { data = "fresh" }), "fresh")
+  shutdown(c, rep.session.daemon_pid)
+  -- a regular file in place of the socket is never connected to nor removed
+  U.write_file(sock, "not a socket")
+  local bad = Client.spawn({ args = { "--session", sname } })
+  H.eq(bad:wait_exit(5), 1, "relay refuses a non-socket")
+  H.ok(bad.stderr:find("not a socket", 1, true), "stderr: " .. bad.stderr)
+  H.eq(U.read_file(sock), "not a socket", "file untouched")
+  os.remove(sock)
+end)
+
+H.test("session: relays started at once share one daemon", function()
+  local sname = sname_of("race")
+  local clients = {}
+  for i = 1, 6 do clients[i] = Client.spawn({ args = { "--session", sname } }) end
+  local pid
+  for i, c in ipairs(clients) do
+    local hello = c:hello()
+    H.ok(hello and hello.ev == "hello" and not hello.err, "relay " .. i .. ": " .. c.stderr)
+    pid = pid or hello.session.daemon_pid
+    H.eq(hello.session.daemon_pid, pid, "relay " .. i .. " reached another daemon")
+  end
+  H.eq(clients[1]:request("session_info").connections, #clients)
+  -- a daemon that lost the lock race gives up on its own; one is left
+  local deadline, n = system.get_time() + 5, nil
+  repeat
+    n = tonumber((U.sh("pgrep -fc -- '--daemon --session " .. sname .. "( |$)'")):match("%d+"))
+    if n == 1 then break end
+    system.sleep(0.1)
+  until system.get_time() > deadline
+  H.eq(n, 1, "daemon processes for the session")
+  for i = 2, #clients do clients[i]:close() end
+  shutdown(clients[1], pid)
+end)
+
+H.test("cleanup: session tests", function() U.cleanup() end)

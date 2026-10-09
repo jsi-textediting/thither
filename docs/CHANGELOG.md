@@ -12,6 +12,30 @@ The wire protocol is versioned by a single integer (`proto_version`, still
 
 ## Unreleased
 
+### Session fixes (2026-10-09)
+
+* A bad relay preamble (root outside the jail or through an escaping
+  symlink, relative or missing root, `env` that is not a map of strings) is
+  refused with an error `relay_ok` for that connection only; it no longer
+  ends the daemon.
+* Preamble roots are stored as realpaths (like `--root`) and must be
+  existing directories; paths spelled through the symlinked form are still
+  accepted.
+* `set_root` records a per-connection project root again and no longer jails
+  the connection (the sessions refactor had made it a jail, so files outside
+  the project and other projects became unreachable). It is stored as a
+  realpath, must be an existing directory and is reported as
+  `info.project_root`; plugins get `on_root(path, conn)`, and
+  `server.project_root` is only kept for stdio servers.
+* Relay: no busy loop while idle, replies in flight are delivered after
+  stdin EOF, `--kill` times out, a non-socket or foreign socket path is
+  refused.
+* Daemon: idle exit shuts down cleanly, `accept` errors back off instead of
+  spinning, `session_closing` and pending replies are drained on shutdown,
+  `server.send` outside a request no longer picks an arbitrary connection.
+* `verify_dir` refuses an existing directory with the wrong mode instead of
+  chmod'ing it; `agent.sock` only points at sockets owned by the user.
+
 ### Capability `apply_edit_dest`, fixes (2026-10-09)
 
 * `apply_edit_dest`: advertised by servers whose `apply_edit` supports `dest`

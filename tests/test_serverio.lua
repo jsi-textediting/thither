@@ -97,3 +97,130 @@ H.test("serverio: poll timeout and multiple descriptors", function()
   serverio.close(lfd)
   U.cleanup()
 end)
+
+H.test("serverio: poll accepts fractional and negative timeouts", function()
+  local dir = U.tmpdir("pollf")
+  local lfd = serverio.listen(dir .. "/f.sock")
+  H.ok(lfd)
+  -- the daemon passes (idle_exit - elapsed) * 1000, which is a float
+  local t0 = system.get_time()
+  local p = serverio.poll({ [lfd] = "r" }, 20.25)
+  H.ok(p and p[lfd] == nil, "no connection yet")
+  H.ok((system.get_time() - t0) * 1000 >= 15, "fractional timeout waited")
+  t0 = system.get_time()
+  p = serverio.poll({ [lfd] = "r" }, -2.5)
+  H.ok(p and p[lfd] == nil)
+  H.ok(system.get_time() - t0 < 0.5, "negative timeout does not wait")
+  H.ok(serverio.poll({}, 0.5))
+  local r, w = serverio.wait(0.5, false, false)
+  H.eq(r, false)
+  H.eq(w, false)
+  serverio.close(lfd)
+  U.cleanup()
+end)
+
+-- fd 0/1 in poll() stand for the protocol channel that serverio_setup() moved
+-- away from fd 0/1 (which become /dev/null and stderr): a child server runs a
+-- script after the same switch.
+H.test("serverio: poll maps fd 0/1 to the protocol channel", function()
+  local dir = U.tmpdir("pollmap")
+  local script = dir .. "/s.lua"
+  U.write_file(script, [[
+local serverio = require "serverio"
+assert(serverio.setup())
+if arg[1] == "idle" then
+  local p = serverio.poll({ [0] = "r" }, 300)
+  io.stderr:write("poll0=", tostring(p[0]), "\n")
+  local w = serverio.poll({ [1] = "w" }, 300)
+  io.stderr:write("poll1=", tostring(w[1]), "\n")
+  serverio.write("PROTO_OUT", 0, 1)
+  print("STRAY_PRINT")
+else
+  local p = serverio.poll({ [0] = "r" }, 3000)
+  io.stderr:write("poll0=", tostring(p[0]), "\n")
+  io.stderr:write("data=", tostring(serverio.read(100, 0)), "\n")
+end
+]])
+  local exe = U.shq(EXEFILE) .. (DATADIR and (" --datadir " .. U.shq(DATADIR)) or "")
+  local out_f, err_f = dir .. "/out", dir .. "/err"
+  local redir = " > " .. U.shq(out_f) .. " 2> " .. U.shq(err_f)
+
+  -- stdin is an open pipe with nothing in it: fd 0 must not be reported
+  -- readable (it would be with /dev/null polled instead: a busy loop)
+  local _, code = U.sh("sleep 2 | " .. exe .. " --run " .. U.shq(script) .. " idle" .. redir)
+  H.eq(code, 0)
+  local err = U.read_file(err_f) or ""
+  H.ok(err:find("poll0=nil", 1, true), "idle protocol input reported ready: " .. err)
+  H.ok(err:find("poll1=w", 1, true), "protocol output writable: " .. err)
+  H.ok(err:find("STRAY_PRINT", 1, true), "print() goes to stderr: " .. err)
+  H.eq(U.read_file(out_f), "PROTO_OUT")
+
+  _, code = U.sh("printf hello | " .. exe .. " --run " .. U.shq(script) .. " feed" .. redir)
+  H.eq(code, 0)
+  err = U.read_file(err_f) or ""
+  H.ok(err:find("poll0=r", 1, true), "pending protocol input reported: " .. err)
+  H.ok(err:find("data=hello", 1, true), "protocol input read: " .. err)
+  U.cleanup()
+end)
+
+H.test("serverio: accept errors carry an errno code", function()
+  local dir = U.tmpdir("accerr")
+  local lfd = serverio.listen(dir .. "/a.sock")
+  H.ok(lfd)
+  local a, code = serverio.accept(lfd)
+  H.eq(a, nil)
+  H.eq(code, "again")
+  local fd = serverio.lock(dir .. "/not-a-socket")
+  local msg
+  a, code, msg = serverio.accept(fd)
+  H.eq(a, nil)
+  H.eq(code, "ENOTSOCK")
+  H.ok(type(msg) == "string" and #msg > 0)
+  serverio.unlock(fd)
+  serverio.close(lfd)
+  U.cleanup()
+end)
+
+-- connecting to a socket owned by another uid ("forbidden") needs root to set
+-- up; check that our own sockets still pass the peer check.
+H.test("serverio: connect checks the peer and accepts our own socket", function()
+  local dir = U.tmpdir("peer")
+  local path = dir .. "/p.sock"
+  local lfd = serverio.listen(path)
+  local cfd, cerr = serverio.connect(path)
+  H.ok(cfd, "connect to own socket: " .. tostring(cerr))
+  local afd = serverio.accept(lfd)
+  H.ok(afd)
+  serverio.close(cfd)
+  serverio.close(afd)
+  serverio.close(lfd)
+  local nfd, nerr = serverio.connect(path)  -- nobody listening any more
+  H.eq(nfd, nil)
+  H.ok(nerr and nerr ~= "forbidden", "plain connect error: " .. tostring(nerr))
+  U.cleanup()
+end)
+
+H.test("serverio: daemonize reports exec failures and returns the pid", function()
+  local pid, code, msg = serverio.daemonize({ "/nonexistent/thither-no-such-daemon" })
+  H.eq(pid, nil)
+  H.eq(code, "ENOENT")
+  H.ok(type(msg) == "string" and msg:find("thither-no-such-daemon", 1, true), tostring(msg))
+
+  pid, code = serverio.daemonize({ "thither-no-such-daemon-in-path" })
+  H.eq(pid, nil)
+  H.eq(code, "ENOENT")
+
+  local dir = U.tmpdir("daemon")
+  local f = dir .. "/pid"
+  pid, code = serverio.daemonize({ "sh", "-c", "echo $$ > " .. U.shq(f) .. ".tmp && mv " .. U.shq(f) .. ".tmp " .. U.shq(f) })
+  H.ok(math.type(pid) == "integer" and pid > 0, "daemon pid: " .. tostring(pid) .. " " .. tostring(code))
+  local got
+  local deadline = system.get_time() + 5
+  while system.get_time() < deadline do
+    got = U.read_file(f)
+    if got then break end
+    system.sleep(0.02)
+  end
+  H.eq(got and tonumber(got:match("%d+")), pid)
+  U.cleanup()
+end)

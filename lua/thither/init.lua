@@ -39,6 +39,7 @@ package.loaded["thither"] = server
 local OUT_HIGH_WATER = 32 * 1024 * 1024
 local FRAMES_PER_TURN = 256
 local IDLE_WAIT_MS = 1000
+local ACCEPT_BACKOFF_MS = 100
 
 ---------------------------------------------------------------------------
 -- logging
@@ -138,12 +139,21 @@ if opts.root then
     return 2
   end
   server.root = rp
+  -- the spelling the user gave, when it differs from the realpath (a root
+  -- below a symlink): paths spelled through it are accepted lexically too
+  if opts.root:sub(1, 1) == "/" and normalize(opts.root) ~= rp then
+    server.root_alias = normalize(opts.root)
+  end
 end
 
 --- Jail of a connection: its own root (set_root, relay preamble), else the
---- server's --root; nil when unjailed.
+--- server's --root; nil when unjailed. The root is always a realpath; the
+--- second result is the spelling it was given in when that differs (nil
+--- otherwise).
 function server.root_of(conn)
-  return (conn and conn.root) or (server.current_conn and server.current_conn.root) or server.root
+  local c = conn or server.current_conn
+  if c and c.root then return c.root, c.root_alias end
+  return server.root, server.root_alias
 end
 
 --- Validates and normalizes a client supplied path ("." and ".." segments
@@ -160,9 +170,11 @@ function server.path(p, nofollow, conn)
   if p:find("\0", 1, true) then server.raise("bad_request", "path contains NUL") end
   if p:sub(1, 1) ~= "/" then server.raise("bad_path", "path must be absolute: " .. p) end
   local norm = normalize(p)
-  local root = server.root_of(conn)
+  local root, alias = server.root_of(conn)
   if not root then return norm end
-  if not under(norm, root) then server.raise("jail", "path is outside the server root") end
+  if not (under(norm, root) or (alias and under(norm, alias))) then
+    server.raise("jail", "path is outside the server root")
+  end
   local probe = norm
   if nofollow and norm ~= root then
     -- the parent is inside the root too: norm is below it, lexically
@@ -180,6 +192,22 @@ function server.path(p, nofollow, conn)
     if probe == "" then probe = "/" end
   end
   return norm
+end
+
+--- Resolves a root requested by a client (set_root, relay preamble) the way
+--- --root is at start-up: it must be an existing directory and is stored as
+--- its realpath. It must lie inside the connection's current jail, if any
+--- (server.path checks the lexical spelling and the realpath of it).
+--- Returns realpath, alias (the normalized spelling when it differs, or nil).
+function server.resolve_root(p, conn)
+  local norm = server.path(p, false, conn)
+  local rp = serverfs.realpath(norm)
+  if not rp then server.raise("ENOENT", "root does not exist: " .. norm) end
+  local st = serverfs.stat(rp)
+  if not st or st.type ~= "dir" then server.raise("ENOTDIR", "root is not a directory: " .. norm) end
+  local cur = server.root_of(conn)
+  if cur and not under(rp, cur) then server.raise("jail", "root resolves outside the server root") end
+  return rp, norm ~= rp and norm or nil
 end
 
 ---------------------------------------------------------------------------
@@ -200,6 +228,7 @@ local function info(conn)
     arch = ARCH,
     home = server.home,
     root = root,
+    project_root = (conn and conn.project_root) or (not server.is_daemon and server.project_root) or nil,
     cwd = serverfs.realpath("."),
     services = names,
     caps = server.caps,
@@ -237,11 +266,17 @@ server.ops.host_info = function()
 end
 server.ops.set_root = function(a, req)
   local c = req and req.conn or server.current_conn
-  local p = server.path(a.path, false, c)
-  if c then c.root = p end
-  server.project_root = p
-  if server.hooks.on_root then
-    for _, fn in ipairs(server.hooks.on_root) do pcall(fn, p, c) end
+  local p, alias = server.resolve_root(a.path, c)
+  -- the project root is information for plugins (on_root), not a jail: only
+  -- --root (the server's, or a relay's in its preamble) confines a connection,
+  -- so files outside the project and other projects stay reachable
+  if c then c.project_root = p end
+  -- single-client (stdio) servers also keep the global for old plugins; a
+  -- daemon has no single project root (plugins get the connection instead)
+  if not server.is_daemon then server.project_root = p end
+  for _, fn in ipairs(server.hooks.on_root) do
+    local ok, err = pcall(fn, p, c)
+    if not ok then server.log("hook on_root failed: %s", tostring(err)) end
   end
   return true
 end
@@ -267,7 +302,7 @@ server.ops.session_shutdown = function(a, req)
     server.raise("bad_request", "session_shutdown is only available in daemon mode")
   end
   server.shutdown_requested = true
-  server.shutdown_timeout = a.timeout_ms or 2000
+  server.shutdown_timeout = tonumber(a.timeout_ms) or 2000
   return true
 end
 server.ops.call = function(a, req)
@@ -326,6 +361,8 @@ function Conn.new(id, copts)
     peer_closed = false,
     closed = false,
     root = copts.root or server.root,
+    root_alias = copts.root and copts.root_alias or (not copts.root and server.root_alias) or nil,
+    project_root = nil, -- set by set_root
     log = copts.log or opts.log,
     env = copts.env or {},
     streams = {},
@@ -406,14 +443,29 @@ server.Conn = Conn
 server.connections = {}
 server.current_conn = nil
 
+--- True when `path` is a unix socket owned by our uid (the only thing the
+--- agent link may point at). serverfs.stat reports sockets as "socket" or,
+--- in builds that do not distinguish them, "other".
+local function is_own_socket(path)
+  if type(path) ~= "string" or path:sub(1, 1) ~= "/" then return false end
+  local st = serverfs.stat(path)
+  if not st or (st.type ~= "socket" and st.type ~= "other") then return false end
+  return st.uid == serverfs.ids().uid
+end
+server.is_own_socket = is_own_socket
+
 local function update_agent_symlink()
   if not server.agent_link then return end
   local sock
   for i = #server.connections, 1, -1 do
     local c = server.connections[i]
-    if not c.closed and c.env and c.env.SSH_AUTH_SOCK and c.env.SSH_AUTH_SOCK ~= "" then
-      sock = c.env.SSH_AUTH_SOCK
-      break
+    local s = not c.closed and c.env and c.env.SSH_AUTH_SOCK
+    if s and s ~= "" then
+      if is_own_socket(s) then
+        sock = s
+        break
+      end
+      server.log("connection %d: SSH_AUTH_SOCK %s is not a socket owned by us, ignored", c.id, s)
     end
   end
   os.remove(server.agent_link)
@@ -423,9 +475,19 @@ local function update_agent_symlink()
 end
 server.update_agent_symlink = update_agent_symlink
 
+--- Sends to the connection of the request being run. Outside a request
+--- (tickers, hooks, the loop itself) there is none: a single-connection
+--- (stdio) server falls back to its only connection, a daemon drops the
+--- message with a log line, since guessing a connection could leak a reply
+--- to another client. Callers that know their connection use conn:send.
 local function send(msg)
-  local c = server.current_conn or server.connections[1]
-  if c then c:send(msg) end
+  local c = server.current_conn
+  if not c and not server.is_daemon then c = server.connections[1] end
+  if c and not c.closed then
+    c:send(msg)
+  else
+    server.log("dropping %s without a connection", tostring(msg.ev or (msg.id and "reply") or "message"))
+  end
 end
 server.send = send
 
@@ -635,12 +697,36 @@ function Conn:handle_frame(msg)
   end
   if not self.greeted then
     if msg.ev == "relay" then
+      -- everything in the preamble comes from the client side: validate it
+      -- without letting an error escape (it would end the whole daemon)
+      local ok, env, root, alias = pcall(function()
+        if self.relay_info then server.raise("bad_request", "duplicate relay preamble") end
+        local e = msg.env
+        if e == nil then e = {} end
+        if type(e) ~= "table" then server.raise("bad_request", "relay env must be a map") end
+        for k, v in pairs(e) do
+          if type(k) ~= "string" or type(v) ~= "string" then
+            server.raise("bad_request", "relay env must map strings to strings")
+          end
+        end
+        local o = msg.opts
+        if o ~= nil and type(o) ~= "table" then server.raise("bad_request", "relay opts must be a map") end
+        local r, a
+        if o and o.root ~= nil then r, a = server.resolve_root(o.root, self) end
+        return e, r, a
+      end)
+      if not ok then
+        local e = type(env) == "table" and env or { code = "internal", msg = tostring(env) }
+        server.log("relay preamble refused: %s: %s", tostring(e.code), tostring(e.msg))
+        self:send_final({ ev = "relay_ok", daemon_version = server.version,
+                          daemon_pid = system.get_process_id(), session = opts.session or "default",
+                          err = { code = e.code, msg = e.msg } })
+        return false
+      end
       self.relay_info = msg
       self.relay_version = msg.relay_version
-      self.env = msg.env or {}
-      if msg.opts and msg.opts.root then
-        self.root = server.path(msg.opts.root, false, self)
-      end
+      self.env = env
+      if root then self.root, self.root_alias = root, alias end
       if server.update_agent_symlink then server.update_agent_symlink() end
       self:send({
         ev = "relay_ok",
@@ -736,7 +822,7 @@ local function main_stdio()
   run_hooks("on_start", { root = server.root, home = server.home, userdir = server.userdir,
                           version = server.version, proto_version = server.proto_version })
 
-  local stdio_conn = Conn.new(1, { root = server.root })
+  local stdio_conn = Conn.new(1)  -- jail: --root (and its alias)
   server.connections = { stdio_conn }
   server.current_conn = stdio_conn
   run_hooks("on_connect", stdio_conn)
@@ -826,7 +912,15 @@ local function main_daemon()
     return 1
   end
 
-  os.remove(sock_path)
+  -- holding the lock, any socket left there is stale; never remove (listen
+  -- unlinks the path too) something that is not our own socket
+  local sock_ok, sock_why = session.check_socket(sock_path)
+  if not sock_ok then
+    serverio.unlock(lock_fd)
+    server.log("refusing %s", tostring(sock_why))
+    return 1
+  end
+  if sock_why == "socket" then os.remove(sock_path) end
   local listen_fd, lkerr = serverio.listen(sock_path)
   if not listen_fd then
     serverio.unlock(lock_fd)
@@ -846,6 +940,10 @@ local function main_daemon()
   local idle_exit_sec = opts.idle_exit or 600
   local tick_hint = IDLE_WAIT_MS
   local more_frames = false
+  -- after an accept() error other than EAGAIN (EMFILE, ENOBUFS, ...) the
+  -- listen fd stays readable: leave it out of the poll set for a while
+  -- instead of spinning, and keep serving the open connections
+  local accept_paused_until = nil
 
   while true do
     local sig = serverio.signalled()
@@ -858,7 +956,17 @@ local function main_daemon()
       break
     end
 
-    local poll_map = { [listen_fd] = "r" }
+    local poll_map = {}
+    local timeout = tick_hint
+    if accept_paused_until and system.get_time() >= accept_paused_until then
+      accept_paused_until = nil
+    end
+    if accept_paused_until then
+      local rem = math.ceil((accept_paused_until - system.get_time()) * 1000)
+      if rem < timeout then timeout = rem end
+    else
+      poll_map[listen_fd] = "r"
+    end
     local ev_fd = serverio.events_fd and serverio.events_fd()
     if ev_fd and ev_fd >= 0 then poll_map[ev_fd] = "r" end
 
@@ -871,12 +979,14 @@ local function main_daemon()
       end
     end
 
-    local timeout = tick_hint
     local live_hint = live_wait_hint()
     if live_hint and live_hint < timeout then timeout = live_hint end
     if more_frames then timeout = 0 end
 
     if idle_exit_sec > 0 then
+      -- server.procs_count: number of live persistent procs, maintained by
+      -- the procs module (phase 3, not there yet); until then only
+      -- connections keep the daemon alive
       local live_count = #server.connections + (server.procs_count or 0)
       if live_count == 0 then
         if not idle_since then idle_since = system.get_time() end
@@ -886,12 +996,13 @@ local function main_daemon()
           server.log("idle timeout reached (%ds), exiting daemon", idle_exit_sec)
           break
         elseif rem < timeout then
-          timeout = rem
+          timeout = math.ceil(rem)
         end
       else
         idle_since = nil
       end
     end
+    timeout = math.ceil(timeout)
     if timeout < 0 then timeout = 0 end
 
     local rev = serverio.poll(poll_map, timeout)
@@ -904,19 +1015,29 @@ local function main_daemon()
     if rev and rev[listen_fd] and rev[listen_fd]:find("r") then
       while true do
         local cfd, uid = serverio.accept(listen_fd)
-        if not cfd then break end
-        local conn = Conn.new(next_conn_id, {
-          fd = cfd,
-          root = server.root,
-          read = function(max) return serverio.read(max, cfd) end,
-          write = function(chunk, off) return serverio.write(chunk, off, cfd) end,
-          write_blocking = function(chunk, to) return serverio.write_blocking(chunk, to, cfd) end,
-          close = function() serverio.close(cfd) end,
-        })
-        next_conn_id = next_conn_id + 1
-        table.insert(server.connections, conn)
-        server.log("accepted connection %d (fd %d, uid %s)", conn.id, cfd, tostring(uid))
-        run_hooks("on_connect", conn)
+        if not cfd then
+          if uid ~= "forbidden" then
+            if uid ~= "again" and uid ~= "EAGAIN" then
+              server.log("accept failed: %s; not accepting for %d ms", tostring(uid), ACCEPT_BACKOFF_MS)
+              accept_paused_until = system.get_time() + ACCEPT_BACKOFF_MS / 1000
+            end
+            break
+          end
+          -- a peer with another uid: accept() already closed it; more may wait
+          server.log("refused a connection from another uid")
+        else
+          local conn = Conn.new(next_conn_id, {
+            fd = cfd,
+            read = function(max) return serverio.read(max, cfd) end,
+            write = function(chunk, off) return serverio.write(chunk, off, cfd) end,
+            write_blocking = function(chunk, to) return serverio.write_blocking(chunk, to, cfd) end,
+            close = function() serverio.close(cfd) end,
+          })
+          next_conn_id = next_conn_id + 1
+          table.insert(server.connections, conn)
+          server.log("accepted connection %d (fd %d, uid %s)", conn.id, cfd, tostring(uid))
+          run_hooks("on_connect", conn)
+        end
       end
     end
 
@@ -952,6 +1073,9 @@ local function main_daemon()
         end
       end
     end
+    -- the rest of the turn runs outside any connection: requests set their
+    -- own (resume), tickers and hooks name the connection they talk to
+    server.current_conn = nil
 
     if #dead > 0 then
       for j = #dead, 1, -1 do
@@ -981,15 +1105,31 @@ local function main_daemon()
   end
 
   server.log("daemon shutting down...")
+  server.current_conn = nil
+  -- tell every client, then give the queued output (session_closing and any
+  -- pending replies) a bounded time to drain before closing
+  local timeout_ms = tonumber(server.shutdown_timeout) or 2000
+  if timeout_ms < 0 then timeout_ms = 0 elseif timeout_ms > 60000 then timeout_ms = 60000 end
+  local flush_deadline = system.get_time() + timeout_ms / 1000
   for _, c in ipairs(server.connections) do
-    if not c.closed then
-      c:send({ ev = "session_closing" })
-      c:flush()
-      c:close()
-    end
+    if not c.closed and not c.peer_closed then c:send({ ev = "session_closing" }) end
   end
+  while true do
+    local pending = {}
+    for _, c in ipairs(server.connections) do
+      if not c.closed and not c.peer_closed and c.out_head <= c.out_tail then
+        c:flush()
+        if not c.peer_closed and c.out_head <= c.out_tail and c.fd then pending[c.fd] = "w" end
+      end
+    end
+    local rem = (flush_deadline - system.get_time()) * 1000
+    if next(pending) == nil or rem <= 0 then break end
+    serverio.poll(pending, math.ceil(math.min(rem, 100)))
+  end
+  for _, c in ipairs(server.connections) do c:close() end
   serverio.close(listen_fd)
   os.remove(sock_path)
+  server.log("daemon exited cleanly")
   if server.agent_link then os.remove(server.agent_link) end
   serverio.unlock(lock_fd)
   run_hooks("on_shutdown")

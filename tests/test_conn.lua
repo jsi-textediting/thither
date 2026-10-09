@@ -200,3 +200,76 @@ H.test("conn: isolated disconnect cleanup", function()
   c2:close()
   U.cleanup()
 end)
+
+H.test("conn: a bad relay preamble refuses that connection only", function()
+  local server = require "thither"
+  local c1 = create_mock_conn(401)
+  local c2 = create_mock_conn(402)
+  c1:feed({ ev = "relay", relay_version = "x", env = "not a map" })
+  local ok, code = c1:step()
+  H.eq(ok, false, "the connection is refused")
+  H.eq(code, 2)
+  local r = c1:recv()
+  H.ok(r and r.ev == "relay_ok" and r.err, "an error relay_ok")
+  H.eq(r.err.code, "bad_request")
+  H.ok(c1.conn.closed, "closed")
+  -- relative and missing roots are errors too, raised inside the validation
+  for _, pre in ipairs({
+    { ev = "relay", opts = { root = "relative/dir" } },
+    { ev = "relay", opts = { root = "/nonexistent/thither/root" } },
+    { ev = "relay", env = { TERM = true } },
+  }) do
+    local m = create_mock_conn(403)
+    m:feed(pre)
+    H.eq(m:step(), false)
+    local rr = m:recv()
+    H.ok(rr and rr.err, "error relay_ok")
+  end
+  -- the other connection is unaffected
+  c2:feed({ ev = "hello", proto_version = server.proto_version })
+  c2:step()
+  H.eq(c2:recv().ev, "hello")
+  c2:close()
+end)
+
+H.test("conn: set_root is per connection and stored as a realpath", function()
+  local server = require "thither"
+  local serverfs = require "serverfs"
+  local tmp = U.tmpdir("croot")
+  U.sh("mkdir -p " .. U.shq(tmp .. "/real") .. " && ln -s real " .. U.shq(tmp .. "/link"))
+  U.write_file(tmp .. "/outside.txt", "o")
+  local real = serverfs.realpath(tmp .. "/real")
+  local c1 = create_mock_conn(501)
+  local c2 = create_mock_conn(502)
+  c1:feed({ ev = "hello", proto_version = server.proto_version })
+  c2:feed({ ev = "hello", proto_version = server.proto_version })
+  c1:step(); c2:step(); c1:recv(); c2:recv()
+  local seen
+  table.insert(server.hooks.on_root, function(p, conn) seen = { p, conn } end)
+  c1:feed({ id = 1, op = "set_root", args = { path = tmp .. "/link" } })
+  c1:step()
+  H.eq(c1:recv().ok, true)
+  table.remove(server.hooks.on_root)
+  H.eq(c1.conn.root, nil, "set_root is not a jail")
+  H.eq(c1.conn.project_root, real)
+  H.eq(c2.conn.project_root, nil, "the other connection keeps its own (none)")
+  H.ok(seen and seen[1] == real and seen[2] == c1.conn, "on_root gets the realpath and the connection")
+  c1:feed({ id = 2, op = "stat", args = { path = tmp .. "/outside.txt" } })
+  c1:step()
+  H.eq(c1:recv().ok.type, "file", "files outside the project stay reachable")
+  c1:close(); c2:close()
+  U.cleanup()
+end)
+
+H.test("conn: server.send outside a request is dropped in daemon mode", function()
+  local server = require "thither"
+  local c1 = create_mock_conn(601)
+  c1:feed({ ev = "hello", proto_version = server.proto_version })
+  c1:step(); c1:recv()
+  local saved_daemon, saved_cur = server.is_daemon, server.current_conn
+  server.is_daemon, server.current_conn = true, nil
+  server.send({ ev = "notify", name = "stray" })
+  server.is_daemon, server.current_conn = saved_daemon, saved_cur
+  H.eq(c1:recv(), nil, "no connection gets a message meant for none")
+  c1:close()
+end)
