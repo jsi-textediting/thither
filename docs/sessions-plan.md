@@ -1,6 +1,18 @@
 # Persistent remote sessions for thither-server: plan
 
-Status: proposal. Nothing here is implemented yet.
+Status (2026-10-09):
+
+- **Phases 0-2 are implemented on the server.** That is the multi-connection
+  core, `serverio` sockets/poll, `serverpty`, and the session daemon and
+  relay (`87b9566`, merged in `b88e5bb`, reviewed and fixed afterwards).
+  A few items in phases 0-2 are still open.
+- **Phases 3-6 are not started.** That covers procs, the clients and polish.
+- See [Implementation status](#implementation-status) for what is done and
+  left in each phase.
+
+The plan was also revised for the repository split, libeditingcore, the
+embedded modules and the 2026-10-09 server fixes (see
+[Changes since the first draft](#changes-since-the-first-draft)).
 
 This plan turns `thither-server` from a "lives as long as the ssh session"
 helper into a persistent per-user session daemon that also hosts terminals and
@@ -14,7 +26,9 @@ Contents: [Motivation](#motivation) | [Goals](#goals-and-non-goals) |
 [Relay](#relay) | [Persistent processes](#persistent-processes-procs) |
 [Protocol additions](#protocol-additions) | [Server internals](#server-internals) |
 [Clients](#clients) | [Security](#security) | [Phases](#phases) |
-[Testing](#testing) | [Risks](#risks-and-open-questions)
+[Testing](#testing) | [Risks](#risks-and-open-questions) |
+[Implementation status](#implementation-status) |
+[Changes since the first draft](#changes-since-the-first-draft)
 
 ## Motivation
 
@@ -36,15 +50,31 @@ What exists today (see `protocol.md`):
 
 - Framed msgpack over ssh stdio.
 - Multiplexed coroutine requests.
-- `fs`, `large_file`, `search`, `watch`, `exec` (pipes only), plugins.
-- The client reconnects automatically and revalidates documents.
+- Caps `fs`, `write_stream`, `watch`, `exec` (pipes only), `call` (plugins),
+  `large_file`, `search`, `blob`, `fs_meta`, `host_info` (user, home, shell:
+  the defaults for `proc_open`) and `apply_edit_dest`.
+- The Lua modules are embedded in the binary (`--datadir` overrides them), and
+  the hello reply carries `build_id`.
+- Process, regex, dirmonitor and system code come from
+  [libeditingcore](https://github.com/jsi-textediting/libeditingcore), shared
+  with Lite XL. Its events wake the main loop through a self-pipe
+  (`src/events.c`).
+- A static build (`-DTHITHER_STATIC=ON`) for old-glibc hosts.
+- The clients live in their own repositories: the Lite XL plugin in lite-xl
+  (`data/plugins/thither/`, copied byte for byte to lite-xl-plugins) and the
+  Emacs package in thither.el. Both reconnect automatically and revalidate
+  documents.
 
-What is missing:
+What was missing when this plan was written, and where it stands:
 
-- **Persistence.** The server exits on stdin EOF and kills every `exec` child
-  ("Running streams are not resumed after a reconnect").
-- **PTYs.** `process.c` only does pipes.
-- **More than one connection.** The Lua core assumes exactly one peer.
+- **More than one connection.** Done (phase 0). Per-connection state lives in
+  `Conn` objects.
+- **PTYs.** Done at the C level (phase 1, `src/pty.c`). Nothing uses them
+  yet: the `proc_*` ops are phase 3. libeditingcore's `process.c` still only
+  does pipes, which is fine for `exec`.
+- **Persistence.** The daemon and relay exist (phase 2): `--session NAME`
+  survives a dropped ssh link. `exec` children still die with their
+  connection, as designed. Long-lived processes need the procs of phase 3.
 
 ## Goals and non-goals
 
@@ -180,12 +210,14 @@ theirs in the preamble.
 
 ### Version skew after an upgrade
 
-- The relay compares its own `SERVER_VERSION` with the version the daemon
-  sends in the preamble reply.
+- The relay compares its own `SERVER_VERSION` and `build_id` with the ones
+  the daemon sends in the preamble reply. The `build_id` catches a rebuilt
+  binary that kept the version number, such as a static build replaced in
+  place on a host.
 - If they differ, the relay still connects. Protocol v1 and caps make this
   safe.
-- The daemon adds `session.version_skew = "<relay version>"` to the hello
-  reply. The client shows a non-blocking notice: "remote session runs
+- The daemon adds `session.version_skew = "<relay version> (<relay build_id>)"`
+  to the hello reply. The client shows a non-blocking notice: "remote session runs
   thither-server X, installed is Y. Restart the session to upgrade (this ends
   its terminals)." The restart is the command `thither:restart-session`, which
   sends `session_shutdown`.
@@ -217,7 +249,7 @@ The daemon handles it like this:
 ## Relay
 
 The relay is a new mode of the existing binary, written in Lua
-(`lua/thither/relay.lua`). It reuses `frame.lua`/`msgpack.lua` for the single
+(`lua/thither/relay.lua`, embedded like the other modules). It reuses `frame.lua`/`msgpack.lua` for the single
 preamble frame, and the `serverio` multi-fd poll from
 [Server internals](#server-internals).
 
@@ -337,7 +369,9 @@ For pickers (filled in during phase 6, best effort, `nil` when unknown):
 
 Do not repeat the `exec` limitation. The PTY module reaps its own children
 with `waitpid(pid, WNOHANG)` per pid. It never calls `waitpid(-1)`, which
-would steal `process.c`'s children. `proc_exit` carries `code` (if
+would steal the children of libeditingcore's `process.c`. Procs also stay out
+of `process.c`'s kill list: `proc_close` does its own HUP-then-KILL with its
+own timer. `proc_exit` carries `code` (if
 `WIFEXITED`) or `signal` (if `WIFSIGNALED`).
 
 ## Protocol additions
@@ -363,7 +397,7 @@ session = { name="default", daemon_pid=..., started=<unix time>, version="...",
 | `proc_list` | `all=false` (`true` includes retained exited procs) | `{procs={ {proc, name, pid, argv, tty, cols, rows, created, alive, code, signal, exited_at, head, tail, attached=<n connections>, alt_screen, title, cwd, fg}... }}` |
 | `proc_attach` | `proc` or `name`, `since` (offset, absent means "from head"), `window`, `redraw` | `{proc, head, tail, cols, rows, alive, alt_screen, gap=<bytes lost before since, or 0>}`, then `proc_data` events from `max(since, head)`. Attaching twice from one connection replaces the first attachment. |
 | `proc_detach` | `proc` | `true`. Idempotent. |
-| `proc_input` | `proc`, `data` (bin) | `true` once queued. Usually sent as a notification. Up to 1 MiB is queued per proc. Above that the request waits (the same back-pressure as `stdin`). `stdin_closed` if the proc has exited. |
+| `proc_input` | `proc`, `data` (bin) | `true` once queued. Usually sent as a notification. Up to 1 MiB is queued per proc. Above that the request waits (the same back-pressure as `stdin`): it sleeps, or waits for the master fd to become writable, and never spins (the `stdin` busy loop fixed on 2026-10-09). `stdin_closed` if the proc has exited. |
 | `proc_resize` | `proc`, `cols`, `rows` | `true`. `TIOCSWINSZ`, and the kernel sends `SIGWINCH`. `bad_request` for `tty=false`. |
 | `proc_signal` | `proc`, `signal="int"\|"term"\|"kill"\|"hup"\|"quit"\|"tstp"\|"cont"\|"winch"`, `fg=true` | `true`. `fg=true` signals the terminal's foreground process group (`tcgetpgrp`), like a key typed into it. Otherwise it signals the proc's own process group. |
 | `proc_ack` | `proc`, `n` | Notification. Returns credit. |
@@ -423,11 +457,21 @@ Conn = { id, fd_in, fd_out, reader, out = queue, requests = {}, greeted = false,
 - `send(msg)` becomes `conn:send(msg)`. `server.send` stays as an alias that
   targets "the connection of the current request". Plugins and ops that only
   reply keep working.
-- `Req` gets `req.conn`. `server.path()` uses `req.conn.root` (the jail
-  becomes per connection).
-- `ops_exec.lua`, `ops_watch.lua` and `ops_fs.lua` (streamed writes) keep
-  their tables per connection, `conn.streams` / `conn.watches` /
-  `conn.writes`. Today's `on_shutdown` cleanup becomes `on_disconnect(conn)`.
+- `Req` gets `req.conn`. `server.path(p[, nofollow])` uses `req.conn.root`
+  (the jail becomes per connection). The rules stay as they are today:
+  - paths are always folded lexically, with or without a root;
+  - with a root, `nofollow` callers (`remove`, `rename`, `symlink`, `link`
+    `to`, `stat{nofollow}`) only resolve the parent directory;
+  - `remove` refuses every spelling of `/` and of the root.
+  The tests from 2026-10-09 run once per connection in the two-connection
+  test.
+- `ops_exec.lua`, `ops_watch.lua`, `ops_fs.lua` (streamed writes) and
+  `ops_large.lua` (C jobs) keep their tables per connection: `conn.streams`,
+  `conn.watches`, `conn.writes`, `conn.jobs`. Today's `on_shutdown` cleanup
+  becomes `on_disconnect(conn)`.
+  - It aborts that connection's writers and cancels its jobs (`job:cancel()`,
+    as a cancelled request already does), so a closing connection leaves no
+    temp files.
 - `main()` becomes:
   - **stdio mode:** one `Conn` on fds 0/1 (from `serverio_setup`). Exit when
     it closes. Identical to today.
@@ -435,8 +479,12 @@ Conn = { id, fd_in, fd_out, reader, out = queue, requests = {}, greeted = false,
     idle rule.
 - Tickers stay global (exec pumping, watch debouncing, proc pumping) and
   iterate over connections.
+  - A ticker with nothing pending returns `nil` (no timed wake-up), as the
+    watch ticker does since 2026-10-09.
+  - A daemon with idle connections and quiet procs sleeps in `poll` until an
+    fd or the event pipe is ready.
 
-Done when the whole existing `tests/remote` suite passes unchanged, plus one
+Done when the whole existing thither `tests/` suite passes unchanged, plus one
 new test that drives two loopback connections inside one process.
 
 ### serverio: multiple fds, unix sockets
@@ -458,13 +506,21 @@ serverio.daemonize(argv)              -> pid of the grandchild, after setsid + d
 
 - All fds are non-blocking and close-on-exec. `serverio.wait` stays as is,
   as a thin wrapper, for stdio mode.
+- The poll set always includes the libeditingcore event pipe
+  (`server_events_fd()`), so dirmonitor changes wake the daemon as they wake
+  today's server.
 - PTY master fds are pollable, so terminal output wakes the loop
-  immediately. The current 1-20 ms cap only applies to `exec` pipes and the
-  dirmonitor, as today.
+  immediately. The 1-20 ms cap only remains for `exec` pipes, which are owned
+  by `process.c` and not pollable from Lua.
 
 ### serverpty: new C module (`src/pty.c`)
 
 POSIX only, built only into the server.
+
+It lives in thither, not libeditingcore. Only the server needs it, and
+libeditingcore's process API is shared with Lite XL on Windows. If Lite XL
+ever wants local terminals, the module can move into libeditingcore behind
+`ec_*` names, like the other shared code.
 
 ```
 serverpty.open{ argv, cwd, env, cols, rows, tty=true }  -> { fd, pid } | nil, code, msg
@@ -508,14 +564,24 @@ serverpty.proc_cwd(pid), serverpty.proc_name(pid)        -> string | nil   (best
 
 ### Build and install
 
-- `cmake/server.cmake`: add `src/pty.c`. On Linux check for
-  `close_range` and `ptsname_r`.
-- Install `lua/thither/relay.lua` and `ops_procs.lua` with the rest of
-  `data/server`.
+- `CMakeLists.txt`: add `src/pty.c`. On Linux check for `close_range` and
+  `ptsname_r`, and keep both the dynamic and the `THITHER_STATIC=ON` build
+  working.
+- `lua/thither/relay.lua` and `ops_procs.lua` are embedded with the other
+  modules (`src/embed.c`). There is nothing to install beyond the binary, and
+  `--extract-data` writes them out.
+- Any changes needed in libeditingcore (e.g. a pollable fd for `process.c`
+  pipes) go into a tagged release, then into the `FetchContent` tag in
+  thither and lite-xl.
 
 ## Clients
 
-### Shared: `data/plugins/thither/client.lua`
+### Lite XL client: `data/plugins/thither/client.lua` (lite-xl repository)
+
+The plugin is maintained in lite-xl and copied byte for byte to
+lite-xl-plugins (`plugins/thither/`). Every change lands in both, checked
+with `diff -r`. Gate each feature on its cap (`procs`, `session`), as Save As
+is gated on `apply_edit_dest`, so the plugin keeps working with older servers.
 
 - **Opt-in.** A new option `session` (default `nil` = today's behaviour). A
   string value names the session, and `true` means `"default"`. When set,
@@ -568,7 +634,18 @@ Session restore:
 - On startup, if the daemon (same `daemon_pid`) still has them, reattach.
   Otherwise offer to recreate them from the phase 6 state file.
 
-### Emacs: `emacs/thither-term.el` (phase 5)
+### Emacs: `thither-term.el` (thither.el repository, phase 5)
+
+`thither-proc.el` already bridges `make-process` and `process-file` over
+`exec`. Terminals and jobs are a separate file because procs outlive the
+connection and `exec` streams do not. Reuse the client machinery:
+
+- **Handlers.** `proc_data` and `proc_exit` handlers run through
+  `thither--run-callback`. An error in a terminal handler is reported and
+  never tears down the connection.
+- **Late replies.** A `proc_attach` reply that arrives after its wait timed
+  out gets the `thither--abandon-stream` treatment: send `proc_detach`, not
+  `proc_close`, so the terminal keeps running.
 
 - Backend: **eat**. It is pure elisp and exposes its terminal object, so a
   terminal can be driven from any byte source by feeding `proc_data` to
@@ -621,12 +698,12 @@ Each phase is shippable and keeps the existing suites green.
 
 | # | Deliverable | Main files | Done when |
 |---|---|---|---|
-| 0 | Multi-connection core refactor, no behaviour change | `lua/thither/init.lua`, `ops_*.lua`, `plugins.lua` | Existing `tests/remote` and `tests/remote_client` pass. A new two-connection loopback test passes. |
-| 1 | `serverio` multi-fd/unix sockets, `serverpty` module | `src/stdio.c`, `src/pty.c`, `cmake/server.cmake` | C-level tests via `--run` scripts: open a pty, `stty size`, resize, exit codes including signals, socket perms and peer uid. |
+| 0 | Multi-connection core refactor, no behaviour change | `lua/thither/init.lua`, `ops_*.lua`, `plugins.lua` | Existing thither `tests/`, lite-xl `tests/remote_client` and thither.el suites pass. A new two-connection loopback test passes. |
+| 1 | `serverio` multi-fd/unix sockets, `serverpty` module | `src/stdio.c`, `src/pty.c`, `CMakeLists.txt` | C-level tests via `--run` scripts: open a pty, `stty size`, resize, exit codes including signals, socket perms and peer uid. The static build passes the same tests. |
 | 2 | Daemon + relay + session lifecycle, env/agent forwarding, version skew notice, `session_info` / `session_shutdown` | `lua/thither/relay.lua`, `init.lua`, `src/main.c` (flags) | Kill the relay mid-session and the daemon survives. A second relay sees the same daemon. Concurrent relay start creates exactly one daemon. A stale socket is recovered. Idle exit works. Wrong dir perms are refused. |
 | 3 | `procs` ops: pty + pipe, ring, attach/resume/gap, flow control, redraw nudge, alt-screen hint, disk log, `proc_read` | `lua/thither/ops_procs.lua` | Protocol tests (below). Doc section added to `protocol.md`. |
-| 4 | Lite XL: client reconnect for procs, jobs UI, terminal view (backend chosen after the evaluation in 4a) | `data/plugins/thither/client.lua`, new `data/plugins/thither/procs.lua`, plugin or native vterm | `tests/remote_client/test_procs.lua`. Manual check over plink against a real host taken from `THITHER_SERVER`. |
-| 5 | Emacs `thither-term.el` (eat backend), `thither-jobs` | `emacs/thither-term.el`, `emacs/test/thither-term-test.el` | ERT tests through WSL, as for the existing Emacs tests. |
+| 4 | Lite XL: client reconnect for procs, jobs UI, terminal view (backend chosen after the evaluation in 4a) | lite-xl: `data/plugins/thither/client.lua`, new `data/plugins/thither/procs.lua`, plugin or native vterm; synced to lite-xl-plugins | lite-xl `tests/remote_client/test_procs.lua`, in WSL and with `run.ps1 -Host`. Manual check over plink against a real host. |
+| 5 | Emacs `thither-term.el` (eat backend), `thither-jobs` | thither.el: `thither-term.el`, `test/thither-term-test.el` | ERT tests via `test/all.sh remote` from WSL Emacs, as for the existing suites. |
 | 6 | Polish: titles/cwd/fg in list, plain-terminal `attach`/`ls`, recreate state file, macOS/BSD verification | `ops_procs.lua`, `relay.lua`, `pty.c` | Tests per item. macOS run recorded in Limitations. |
 
 Rough size (excluding the terminal emulator choice):
@@ -649,11 +726,18 @@ All tests read real hosts from environment variables (`THITHER_SERVER`, ...) wit
 placeholder defaults such as `remote-box`. Nothing host-specific goes in the
 repo.
 
-`tests/remote` (server, run by the binary itself):
+`tests/` in thither (server, run by the binary itself with
+`thither-server --datadir lua --run tests/run.lua [filter]`):
 
 - `test_conn.lua` (phase 0): two loopback connections, interleaved requests,
-  per-connection jail, watch and exec cleanup when one connection closes
-  while the other keeps working.
+  per-connection jail (with the 2026-10-09 path rules), watch, exec, writer
+  and job cleanup when one connection closes while the other keeps working:
+  no temp files left.
+- **Load checks** reuse the `/proc` helpers in `test_exec_watch.lua` (CPU
+  ticks and voluntary context switches over a few seconds):
+  - an idle daemon with connections and detached procs does not wake up;
+  - a chatty proc with no client attached costs only the draining;
+  - `proc_input` back-pressure does not spin.
 - `test_session.lua` (phase 2):
   - spawn `--session t-<random>` relays as child processes
   - kill one with `SIGKILL` and confirm the daemon stays
@@ -681,12 +765,24 @@ repo.
   - `proc_opened`/`proc_closed` broadcast to a second connection
   - ring total cap and eviction
 
-`tests/remote_client` (Lite XL, phase 4):
+lite-xl `tests/remote_client` (Lite XL, phase 4):
 
 - Reconnect resumes a terminal: kill the transport child, wait for
   reconnect, check that the bytes produced meanwhile arrive once and in
   order.
 - Jobs list updates.
+
+Real host, before each phase lands (host names from the environment, never in
+the repo):
+
+- **Server:** build with `-DTHITHER_STATIC=ON`, copy it to the host next to
+  the installed binary, and run the suites against the copy. Move it into
+  place only after they pass, keeping the old binary.
+- **Lite XL:** `tests\remote_client\run.ps1 -Host <session> -Server <path>`.
+  Use `-BigMB` of at least 512: the large-file tests address lines past 6
+  million.
+- **Emacs:** `THITHER_SERVER="plink.exe -ssh -batch -T <session> <path> --stdio" test/all.sh remote`
+  from WSL Emacs.
 
 Manual, before each phase lands:
 
@@ -701,8 +797,8 @@ Manual, before each phase lands:
   stale screen until the next update. Measure with vim, htop, less, mc and
   top in phase 3, and decide then whether a libvterm snapshot is worth it.
 - **Plugin API change** (per-connection `notify`, `on_shutdown` meaning).
-  Audit the plugins in `lua/thither/plugins/` and any known external ones
-  before phase 0 lands.
+  Audit `plugins/echo.lua` and any known external plugins before phase 0
+  lands.
 - **One daemon, many roots.** Moving the jail per connection touches every
   `server.path()` caller. Phase 0 must cover it with tests.
 - **Memory.** 4 MiB × many terminals. The total cap plus eviction of exited
@@ -710,7 +806,12 @@ Manual, before each phase lands:
   session view.
 - **Old glibc / static builds.** `posix_openpt`, `close_range` and
   `SO_PEERCRED` all need compile-time checks and fallbacks. The static build
-  on old-glibc hosts (see the plugin README) must keep working.
+  on old-glibc hosts (`-DTHITHER_STATIC=ON`, in use on glibc 2.28) must keep
+  working.
+  - A static glibc binary needs the host's NSS libraries for `getpwuid`
+    (the linker warns about it). So the daemon's paths (runtime dir, state
+    dir, default shell) come from `$XDG_RUNTIME_DIR`, `$HOME`, `$SHELL` and
+    `getuid()` first, and from `getpwuid` only as a fallback.
 - **Hosts that kill user processes at logout** (`systemd-logind`
   `KillUserProcesses=yes`) will kill the daemon too, as they do tmux.
   Document the `loginctl enable-linger` workaround, and optionally start the
@@ -721,3 +822,169 @@ Manual, before each phase lands:
 - **Name collision with an existing `exec` stream id space.** Procs use
   their own `proc` id and `proc_*` event names, so existing clients that
   ignore unknown events are unaffected.
+
+## Implementation status
+
+As of 2026-10-09: `b88e5bb` (phases 0-2 merged) plus the session review
+fixes on top of it.
+
+- The full server suite passes, 160 tests, in both the dynamic and the static
+  build.
+- A real old-glibc host (kernel 4.18, so the `close_range` fallback paths
+  ran) passed the server suite, the Lite XL remote client suite and the
+  Emacs suites. The Emacs suites ran both in stdio mode and through
+  `--session`, with one daemon serving every connection.
+
+### Phase 0: multi-connection core. Done
+
+- `Conn` objects with per-connection reader, output queue, requests, jail
+  root and project root.
+- Per-connection `exec` streams, watches and streamed writers, each cleaned up
+  in `on_disconnect`. Closing a connection cancels its requests, so a running
+  large-file job is cancelled too and leaves no temp file.
+- `server.path(p, nofollow, conn)`, `server.root_of(conn)` and
+  `server.resolve_root`.
+  - Roots are stored as realpaths, and the symlinked spelling is still
+    accepted.
+  - `server.current_conn` is cleared outside per-connection work.
+  - In a daemon, `server.send` without a connection is dropped.
+- `set_root` records the connection's project root (`info.project_root`) and
+  is **not** a jail. Only `--root`, the server's or a relay's, confines a
+  connection.
+- Hooks: `on_connect` / `on_disconnect`, `on_root(path, conn)`, and
+  `server.notify(event, data, conn)`. They are documented in `protocol.md`
+  and the `plugins.lua` header.
+- Tests: two connections, a jail per connection, the 2026-10-09 path rules
+  (`nofollow`, `..`, `remove` of the root) through daemon connections, a
+  project root per connection, and cleanup when a connection closes.
+
+Left:
+
+- Audit `plugins/echo.lua` and any external plugins for the per-connection
+  API.
+
+### Phase 1: serverio and serverpty. Done, with gaps
+
+- `serverio`:
+  - `listen` / `accept` / `connect`, each checking the peer uid with
+    `SO_PEERCRED` or `getpeereid` and failing closed where neither exists;
+  - `poll`, which maps fds 0 and 1 to the protocol channel, takes fractional
+    timeouts and includes the event pipe;
+  - `lock` / `unlock`;
+  - `daemonize`, which reports fork and exec failures through an errno pipe;
+  - errno codes for `accept` errors.
+- `serverpty.open` / `resize` / `reap` / `signal` / `fg_pgrp` / `proc_cwd` /
+  `proc_name`:
+  - exec failures are reported;
+  - the child starts with default signal dispositions and an empty mask;
+  - the environment is built before `fork`;
+  - `close_range` falls back to a loop on old kernels;
+  - array-style `env` is accepted.
+- The static build passes the same tests.
+
+Left:
+
+- **Pipe mode.** `serverpty.open{tty=false}` (pipes with stdout and stderr
+  merged, in its own process group) is not implemented. Phase 3 jobs need it.
+- **Build checks.** `CMakeLists.txt` has no `close_range` / `ptsname_r`
+  checks. The code relies on `#ifdef`s and runtime fallbacks.
+- **Socket type.** `serverfs.stat` reports sockets as `type="other"`, the
+  same as FIFOs and devices. The session socket checks accept "other" plus
+  the owner check. Report `S_ISSOCK` as "socket" in `fsops.c` to make them
+  exact.
+
+### Phase 2: daemon, relay, lifecycle. Done, with gaps
+
+- Flags: `--session`, `--daemon`, `--kill` (5 s deadline), `--idle-exit`
+  (clean shutdown) and `--retain-exited`.
+- Runtime and state directories:
+  - a `sun_path` length check;
+  - owner, mode and symlink checks: a wrong existing directory is refused,
+    not `chmod`ed;
+  - the socket path is checked to be our own socket before connect or
+    remove.
+  - `daemon.log` rotates at 1 MiB.
+- Relay:
+  - start-up under `flock`;
+  - the preamble / `relay_ok` handshake: a bad preamble is refused for that
+    connection only and never ends the daemon;
+  - a raw byte copy without busy polling;
+  - replies in flight are delivered after stdin EOF.
+- Daemon:
+  - the hello `session` table, `host_info.session_name`, `session_info` and
+    `session_shutdown`;
+  - `session_closing` is delivered at shutdown, with a bounded drain;
+  - backs off on `accept` errors.
+- `agent.sock` only ever points at a socket owned by the current uid.
+- Tests:
+  - relay start, many relays started at once giving one daemon, the daemon
+    surviving a relay kill, stale socket recovery;
+  - a refused `0755` directory, refused bad preambles, symlinked roots;
+  - an idle relay that does not spin, delivery after stdin EOF, `--kill`
+    timeouts, a clean idle exit, and the agent symlink.
+- The `--session` section of `docs/protocol.md` and the CHANGELOG entry.
+
+Left:
+
+- **Environment subset.** The relay forwards `SSH_*`, `TERM`, `LANG` and
+  `LC_ALL` only. The plan's list also has `DISPLAY`, `WAYLAND_DISPLAY`,
+  `TERM_PROGRAM`, `COLORTERM` and every `LC_*`, and should be configurable.
+- **Preamble options.** Only `root` is applied per connection. `--log` (the
+  per-connection request log) and the `--plugins` mismatch report are not.
+- **Version skew.**
+  - The daemon compares the relay's `relay_version` only. It should also
+    compare `build_id`, and the relay should compare `relay_ok.daemon_version`.
+  - The `session.version_skew` string should carry the build id.
+- **Relay half-close.** `serverio` has no `shutdown()`. After stdin EOF the
+  relay waits for 1 s of quiet (10 s at most) instead of half-closing the
+  socket.
+- **Missing tests.** `SIGTERM` to the daemon shuts it down cleanly. The
+  back-off after an `accept` error (needs EMFILE).
+- **NSS-free paths.** The runtime and state dirs use `serverfs.ids().uid` and
+  `serverfs.home()`. Check that neither depends on `getpwuid` in the static
+  build when `$HOME` is set.
+- **Protocol op table.** `session_info` / `session_shutdown` and the hello
+  `session` table are described in the `--session` section, but have no rows
+  in the op tables.
+
+### Phases 3-6. Not started
+
+- **3, procs.** `lua/thither/ops_procs.lua`:
+  - the `procs` cap and every `proc_*` op and event;
+  - ring buffers with `gap`, attach and resume by offset, flow control;
+  - redraw nudge, alt-screen hint, disk log, `proc_read`;
+  - ring total cap and eviction, `--retain-exited` semantics;
+  - `SIGTERM` closing procs (HUP, then KILL);
+  - `server.procs_count` for idle exit;
+  - the protocol doc section and `test_procs.lua` with load tests.
+- **4, Lite XL.**
+  - In lite-xl, synced to lite-xl-plugins: the `session` option, keeping
+    procs across reconnect, `remote.procs.*`, the jobs view, the terminal
+    view and session restore.
+  - The terminal emulator choice (4a) comes first.
+  - `tests/remote_client/test_procs.lua`.
+- **5, Emacs.** thither.el: `thither-term.el` (eat backend), `thither-jobs`,
+  `thither-run-job`, `thither-session-info`, ERT tests.
+- **6, polish.**
+  - `title` / `cwd` / `fg` in `proc_list`;
+  - `thither-server --session NAME attach` / `ls`;
+  - a state file to recreate terminals;
+  - macOS and BSD runs.
+
+## Changes since the first draft
+
+Revised 2026-10-09. The design is unchanged. These are the facts it now
+builds on:
+
+| Change | Effect on this plan |
+|---|---|
+| thither, the Lite XL plugin and the Emacs package are separate repositories (thither, lite-xl with a synced copy in lite-xl-plugins, thither.el) | File paths in [Clients](#clients), [Phases](#phases) and [Testing](#testing) name the repository. Each phase lands in each affected repository. |
+| Process, regex, dirmonitor and system code moved to libeditingcore | `process.c` is libeditingcore's. `serverpty` stays in thither. Changes to shared code need a libeditingcore release and a tag bump. |
+| Lua modules embedded in the binary, `build_id` in hello | No install step for `relay.lua` / `ops_procs.lua`. Version skew also compares `build_id`. |
+| Dirmonitor events wake the loop through a self-pipe; an idle watch no longer ticks | The daemon's poll set includes the event pipe. Tickers return `nil` when idle. Load tests guard both. |
+| `stdin` back-pressure sleeps instead of spinning | `proc_input` uses the same approach, with a load test. |
+| Paths always folded lexically; `nofollow` ops resolve only the parent under `--root`; `remove` refuses every spelling of `/` | These rules carry over to the per-connection jail in phase 0, tested per connection. |
+| Failed writes and cancelled jobs clean up their temp files at once | `on_disconnect(conn)` aborts writers and cancels jobs the same way. |
+| Caps `fs_meta`, `host_info`, `apply_edit_dest`; clients gate features on caps | `proc_open` defaults come from `host_info`. The clients gate `procs` / `session` the same way. |
+| Static build in use on an old-glibc host; real-host test runs with `run.ps1 -Host` and `test/all.sh remote` | New PTY/socket code must build static. NSS-free path lookups. Real-host runs are part of each phase's checklist. |
+| Emacs callback errors no longer kill the connection; late exec replies are abandoned cleanly | Terminal handlers and late `proc_attach` replies use the same helpers. |
