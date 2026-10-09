@@ -73,6 +73,7 @@ static const luaL_Reg server_libs[] = {
   { "process",     ec_luaopen_process     },
   { "dirmonitor",  ec_luaopen_dirmonitor  },
   { "serverio",    luaopen_serverio    },
+  { "serverpty",   luaopen_serverpty   },
   { "serverfs",    luaopen_serverfs    },
   { "serverembed", luaopen_serverembed },
   { NULL, NULL }
@@ -131,6 +132,11 @@ static void usage(FILE *f) {
     "Usage: thither-server [options]\n\n"
     "Options:\n"
     "  --stdio             Speak the protocol on stdin/stdout (default)\n"
+    "  --session [name]    Connect to/manage named persistent session (default: default)\n"
+    "  --daemon            Run as background session daemon\n"
+    "  --kill              Shut down the named session daemon\n"
+    "  --idle-exit <sec>   Idle timeout before daemon exits (default 600)\n"
+    "  --retain-exited <sec> Time to retain exited process buffers (default 3600)\n"
     "  --root <dir>        Restrict non-exec file operations to <dir>\n"
     "  --log <file>        Append a request log to <file>\n"
     "  --plugins <dir>     Load server plugins from <dir> (repeatable)\n"
@@ -148,6 +154,8 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
 
   const char *datadir_opt = NULL, *root = NULL, *logfile = NULL, *run_script = NULL;
+  const char *session = NULL;
+  int is_daemon = 0, is_kill = 0, idle_exit = 600, retain_exited = 3600;
   const char *plugins[64];
   int nplugins = 0, run_first_arg = 0;
 
@@ -169,6 +177,20 @@ int main(int argc, char **argv) {
       return EXIT_SUCCESS;
     } else if (!strcmp(a, "--stdio")) {
       /* default */
+    } else if (!strcmp(a, "--session")) {
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        session = argv[++i];
+      } else {
+        session = "default";
+      }
+    } else if (!strcmp(a, "--daemon")) {
+      is_daemon = 1;
+    } else if (!strcmp(a, "--kill")) {
+      is_kill = 1;
+    } else if (!strcmp(a, "--idle-exit") && i + 1 < argc) {
+      idle_exit = atoi(argv[++i]);
+    } else if (!strcmp(a, "--retain-exited") && i + 1 < argc) {
+      retain_exited = atoi(argv[++i]);
     } else if (!strcmp(a, "--root") && i + 1 < argc) {
       root = argv[++i];
     } else if (!strcmp(a, "--log") && i + 1 < argc) {
@@ -239,6 +261,26 @@ int main(int argc, char **argv) {
   lua_newtable(L);
   if (root)    { lua_pushstring(L, root);    lua_setfield(L, -2, "root"); }
   if (logfile) { lua_pushstring(L, logfile); lua_setfield(L, -2, "log"); }
+  if (session) {
+    lua_pushstring(L, session);
+    lua_setfield(L, -2, "session");
+  }
+  if (is_daemon) {
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "daemon");
+  }
+  if (is_kill) {
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "kill");
+  }
+  lua_pushinteger(L, idle_exit);
+  lua_setfield(L, -2, "idle_exit");
+  lua_pushinteger(L, retain_exited);
+  lua_setfield(L, -2, "retain_exited");
+  if (session && !is_daemon) {
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "relay");
+  }
   lua_newtable(L);
   for (int i = 0; i < nplugins; i++) {
     lua_pushstring(L, plugins[i]);
@@ -268,6 +310,9 @@ int main(int argc, char **argv) {
     "end\n"
     "local main, err\n"
     "if arg and arg[0] then main, err = loadfile(arg[0])\n"
+    "elseif SERVER_OPTS and SERVER_OPTS.relay then\n"
+    "  if DATADIR then main, err = loadfile(DATADIR .. '/thither/relay.lua')\n"
+    "  else main, err = require('serverembed').load('thither/relay.lua') end\n"
     "elseif DATADIR then main, err = loadfile(DATADIR .. '/thither/init.lua')\n"
     "else main, err = require('serverembed').load('thither/init.lua') end\n"
     "if not main then io.stderr:write('thither-server: ', err, '\\n') return 1 end\n"

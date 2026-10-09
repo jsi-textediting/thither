@@ -112,7 +112,7 @@ return function(server)
     end
   end
 
-  ops.watch = function(a)
+  ops.watch = function(a, req)
     local path = server.path(a.path)
     local st = server.unwrap(serverfs.stat(path))
     if not monitor then monitor = dirmonitor.new() end
@@ -120,28 +120,33 @@ return function(server)
     next_id = next_id + 1
     local w = {
       id = id, root = path, recursive = a.recursive and true or false,
+      conn = req and req.conn,
       debounce = (tonumber(a.debounce_ms) or 50) / 1000,
       max_pending = math.max(1, math.tointeger(a.max_pending) or 1024),
       dirs = {}, inos = {}, kids = {}, ndirs = 0, pending = {}, npending = 0, overflow = false, truncated = false,
     }
     watches[id] = w
+    if req and req.conn then req.conn.watches[id] = w end
     nwatches = nwatches + 1
     if w.recursive and st.type == "dir" then add_tree(w, path, st.ino) else add_dir(w, path, st.ino) end
     if w.ndirs == 0 then
       watches[id] = nil
+      if req and req.conn then req.conn.watches[id] = nil end
       nwatches = nwatches - 1
       raise("watch_failed", "cannot watch " .. path .. " (is the inotify watch limit reached?)")
     end
     return { watch = id, dirs = w.ndirs, truncated = w.truncated }
   end
 
-  ops.unwatch = function(a)
+  ops.unwatch = function(a, req)
     local w = watches[a.watch]
     if not w then return true end
+    if req and req.conn and w.conn and w.conn ~= req.conn then return true end
     local all = {}
     for d in pairs(w.dirs) do all[#all + 1] = d end
     for _, d in ipairs(all) do release_dir(w, d) end
     watches[w.id] = nil
+    if w.conn and w.conn.watches then w.conn.watches[w.id] = nil end
     nwatches = nwatches - 1
     return true
   end
@@ -228,12 +233,14 @@ return function(server)
         local due = w.first_at + w.debounce
         if now >= due then
           if w.overflow then
-            server.send({ ev = "overflow", watch = w.id })
+            local msg = { ev = "overflow", watch = w.id }
+            if w.conn then w.conn:send(msg) else server.send(msg) end
           else
             local paths = {}
             for p in pairs(w.pending) do paths[#paths + 1] = p end
             table.sort(paths)
-            server.send({ ev = "watch", watch = w.id, paths = paths })
+            local msg = { ev = "watch", watch = w.id, paths = paths }
+            if w.conn then w.conn:send(msg) else server.send(msg) end
           end
           w.pending, w.npending, w.overflow, w.first_at = {}, 0, false, nil
         else
@@ -242,5 +249,15 @@ return function(server)
       end
     end
     return hint
+  end)
+
+  server.on_disconnect(function(conn)
+    local to_remove = {}
+    for wid, w in pairs(watches) do
+      if w.conn == conn then to_remove[#to_remove + 1] = wid end
+    end
+    for _, wid in ipairs(to_remove) do
+      ops.unwatch({ watch = wid })
+    end
   end)
 end

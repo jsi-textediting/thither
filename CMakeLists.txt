@@ -114,6 +114,7 @@ add_executable(thither-server
     "${_th_src}/fsops.c"
     "${_th_src}/embed.c"
     "${_th_src}/events.c"
+    "${_th_src}/pty.c"
     "${_th_embed_c}"
 )
 set_target_properties(thither-server PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)

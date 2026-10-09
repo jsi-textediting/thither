@@ -17,6 +17,7 @@ int server_events_fd(void);      /* read end, -1 before init */
 void server_events_drain(void);
 
 int luaopen_serverio(lua_State *L);
+int luaopen_serverpty(lua_State *L);
 
 /* serverfs: POSIX filesystem helpers, see fsops.c */
 int luaopen_serverfs(lua_State *L);
