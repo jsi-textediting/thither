@@ -237,6 +237,33 @@ H.test("fs: mkdir, parents, remove, recursive remove", function()
   H.eq(err.code, "ENOENT")
   _, err = c:request("remove", { path = "/", recursive = true })
   H.eq(err.code, "EINVAL")
+  for _, p in ipairs({ "//", "/.", "/./", "/tmp/..", dir .. "/../../../../../../../.." }) do
+    local _, e = c:request("remove", { path = p, recursive = true })
+    H.eq(e and e.code, "EINVAL", "remove " .. p)
+  end
+  U.sh("mkdir -p " .. dir .. "/keep/sub")
+  _, err = c:request("remove", { path = dir .. "/keep/sub/.." })
+  H.eq(err and err.code, "ENOTEMPTY", "keep/sub/.. names keep")
+  H.ok(U.exists(dir .. "/keep/sub"))
+  c:close()
+end)
+
+H.test("fs: readdir slices that would exceed a frame are cut short with more=true", function()
+  local dir = U.tmpdir("rdbig")
+  local c = connect()
+  local target = "/" .. string.rep("t", 4000)
+  for i = 1, 4000 do
+    assert(c:request("symlink", { target = target, path = string.format("%s/l%04d", dir, i) }))
+  end
+  local r = c:request("readdir", { path = dir, limit = 50000 })
+  H.eq(r.total, 4000)
+  H.ok(#r.entries > 0 and #r.entries < 4000, "cut short: " .. #r.entries)
+  H.eq(r.more, true)
+  H.eq(r.entries[1].link, target)
+  local r2 = c:request("readdir", { path = dir, offset = #r.entries, limit = 50000 })
+  H.eq(#r.entries + #r2.entries, 4000)
+  H.eq(r2.more, false)
+  H.eq(r2.entries[#r2.entries].name, "l4000")
   c:close()
 end)
 

@@ -18,6 +18,7 @@ return function(server)
   local DEFAULT_WINDOW = 1024 * 1024
   local READ_SIZE = 65536
   local STDIN_HIGH_WATER = 1024 * 1024
+  local STDIN_POLL_MS = 5
 
   local streams, nstreams, next_sid = {}, 0, 1
 
@@ -87,8 +88,10 @@ return function(server)
       end
     end
     if a.close then st.close_stdin = true end
+    -- wait for the ticker to drain the queue; sleep rather than yield, a
+    -- yielding request makes the event loop poll without timeout (busy loop)
     while st.inq_bytes > STDIN_HIGH_WATER and streams[st.id] and not st.stdin_closed do
-      req:yield()
+      req:sleep(STDIN_POLL_MS)
     end
     return true
   end

@@ -78,7 +78,8 @@ client -> { ev="hello", proto_version=1, client_version="...", caps={...} }
 server -> { ev="hello", server_version="2.1.7", build_id="07032848c4a3", proto_version=1, pid=..., platform="Linux",
             arch="x86_64-linux", home="/home/u", root=<jail root or absent>, cwd="/...",
             services={"echo",...}, caps={"fs","write_stream","watch","exec","call",
-            "large_file","search","blob","fs_meta","host_info"}, max_frame=16777216 }
+            "large_file","search","blob","fs_meta","host_info","apply_edit_dest"},
+            max_frame=16777216 }
 ```
 
 * The protocol version is a single integer; the server speaks exactly `1`. Any
@@ -158,7 +159,12 @@ A response whose encoded size would exceed the frame limit is replaced by
 Paths are absolute POSIX paths (the client translates mount-root paths, see
 [Path forms](#path-forms-phase-0-spike-a)). With `--root <dir>` every op except
 `exec` and plugin `call`s must stay inside the realpath of `<dir>`; the jail is
-advisory because `exec` can run anything.
+advisory because `exec` can run anything. The server folds `.`/`..` segments and
+repeated or trailing slashes lexically (with or without `--root`). Ops that act
+on a directory entry itself and never follow it (`remove`, `rename`, `symlink`,
+the `to` of `link`, `stat` with `nofollow`) only need its parent directory to
+resolve inside the root, so a symlink in the root pointing outside can still be
+removed, renamed, replaced or `lstat`ed.
 
 **etag**: the string `"<mtime_ns>-<size>-<inode>"` (decimal), computed from the
 file's stat. It changes whenever the file is rewritten (including by the
@@ -183,7 +189,7 @@ Symlinks are followed (the table describes the target and carries
 | `home` | - | home directory string |
 | `set_root` | `path` | `true`; tells server plugins the project root (`on_root`) |
 | `stat` | `path`, `nofollow` | stat table; errors `ENOENT`, ... |
-| `readdir` | `path`, `offset=0`, `limit=20000` (max 50000) | `{entries={stat tables with name, sorted by name in byte order}, total=<entries in the directory>, offset, more=<bool>}`. Only the requested slice is stat'ed. `.` and `..` are omitted. |
+| `readdir` | `path`, `offset=0`, `limit=20000` (max 50000) | `{entries={stat tables with name, sorted by name in byte order}, total=<entries in the directory>, offset, more=<bool>}`. Only the requested slice is stat'ed. `.` and `..` are omitted. A slice that would not fit in one frame (long names or symlink targets) is cut short: fewer than `limit` entries with `more=true`; continue at `offset + #entries`. |
 | `read` | `path`, `offset=0`, `len` (<= 8 MiB), `etag` (optional) | `{data=<bin>, etag, eof=<bool>}`; `stale` if `etag` no longer matches. A short result means end of file. |
 | `write` | `path`, `data`, `if_match`, `mode`, `create_dirs` | stat table of the new file. See below. |
 | `write_begin` | `path`, `if_match`, `mode`, `create_dirs` | `{wid}`; streamed write (max 64 sessions per connection) |
@@ -191,7 +197,7 @@ Symlinks are followed (the table describes the target and carries
 | `write_commit` | `wid` | stat table; checks `if_match` now |
 | `write_abort` | `wid` | `true`; removes the temp file |
 | `mkdir` | `path`, `parents=false`, `mode` | `true`; `parents` is idempotent like `mkdir -p` |
-| `remove` | `path`, `recursive=false` | `true`; recursive never follows symlinks; refuses `/` |
+| `remove` | `path`, `recursive=false` | `true`; recursive never follows symlinks; refuses `/` (also spelled `//`, `/.`, `/a/..`, ...) with `EINVAL` and the `--root` itself with `jail` |
 | `rename` | `from`, `to`, `overwrite=true` | `true`; `overwrite=false` fails with `EEXIST` (atomic via `renameat2` where available) |
 | `realpath` | `path` | resolved path string |
 | `chmod` | `path`, `mode` | `true`; permission bits (`0o7777`), symlinks followed |
@@ -275,7 +281,8 @@ hash_ranges { path, ranges = { {off, len}, ... }, etag }  -> { <int>, ... }   | 
 
 Returns the 64-bit FNV-1a hash of each range (as a signed integer, ranges are
 cut at the end of the file), in the order of `ranges`; at most 64 MiB in all
-per request. The client compares them with the fingerprints its buffer keeps
+per request. `ranges` must be a list (a table with keys other than `1..n` is
+`bad_request`). The client compares them with the fingerprints its buffer keeps
 of the chunks it loaded, without transferring the bytes. Older servers answer
 `unknown_op`: fall back to `read_range`.
 
@@ -297,6 +304,9 @@ separate copy). A new `dest` gets the original's permission bits, an existing
 one keeps its own permissions and owner. `dest_if_match` mismatches are
 `EEXIST` for `"-"` and `conflict` (with `err.etag` of `dest`) otherwise; without
 it `dest` is replaced unconditionally. The returned index is cached for `dest`.
+Servers that support `dest`/`dest_if_match` advertise the capability
+`apply_edit_dest`; clients should check it before offering "save as" through
+`apply_edit`, since a server without it may ignore `dest` and edit `path`.
 
 The server builds a temp file next to the target by copying the kept ranges of
 the original (`copy_file_range`, falling back to `pread`/`write`) and writing
@@ -439,7 +449,8 @@ server.on_shutdown(function() end)     -- connection closed / server exiting
 server.notify("progress", { n = 3 })   -- pushes { ev="notify", name="progress", data={n=3} }
 server.log("text %s", x)               -- to the --log file
 server.raise(code, msg)                -- raise a protocol error from a handler
-server.path(p)                         -- validate/normalize a client path (applies the jail)
+server.path(p[, nofollow])             -- validate/normalize a client path (applies the jail;
+                                       -- nofollow: only the parent must resolve inside it)
 server.unwrap(serverfs.stat(p))        -- turn (nil, code, msg) results into protocol errors
 ```
 
@@ -494,35 +505,36 @@ cmake -S thither -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build                       # build/thither-server, about 0.9 MB
 ```
 
-* Dependencies are fetched by CMake: Lua 5.5 and PCRE2. There is **no SDL**:
-  the few SDL calls in the shared editor sources resolve to `src/compat/`
-  (pthreads and libc), and the binary links only libc/libm (plus libdl on
-  older glibc).
+* Dependencies are fetched by CMake: Lua 5.5, PCRE2 and
+  [libeditingcore](https://github.com/jsi-textediting/libeditingcore) (tag
+  `v0.1.0`), the static library Lite XL also uses for native process
+  execution, regex, directory monitoring and the window-less part of the
+  `system` module. There is **no SDL**; the binary links only libc/libm (plus
+  libdl on older glibc) and pthreads.
+* `-DFETCHCONTENT_SOURCE_DIR_EDITINGCORE=../libeditingcore` builds against a
+  local libeditingcore checkout instead of fetching the tag.
 * `THITHER_STATIC=ON` links statically (about 2.3 MB; glibc warns about
   `dlopen`/`getpwuid`), for hosts with an old glibc.
 * `THITHER_DIRMONITOR_BACKEND` picks `inotify`, `fsevents`, `kqueue` or `dummy`
-  (detected when empty).
-* `THITHER_LITE_SRC` is the Lite XL `src/` directory that provides the shared
-  `system.c`, `process.c`, `dirmonitor.c` and `regex.c` (default `../src`).
-  They are compiled with `-DTHITHER`, which removes the window, event-loop,
-  clipboard and dialog functions. The Lua libraries are `system`, `process`,
-  `dirmonitor`, `regex` (the editor's) and `serverio`, `serverfs`,
-  `serverembed` (the server's).
-* Inside the Lite XL build, `-DLITE_BUILD_THITHER=ON` adds this project with
-  `add_subdirectory` and reuses the editor's Lua and PCRE2 targets.
+  (detected when empty); it is passed on to libeditingcore.
+* The Lua libraries are `system`, `process`, `dirmonitor`, `regex` (from
+  libeditingcore) and `serverio`, `serverfs`, `serverembed` (the server's,
+  `src/`). libeditingcore reports dirmonitor changes through event hooks;
+  the server installs a self-pipe for them (`src/events.c`).
+* When a parent project includes this one with `add_subdirectory` and already
+  defines the `lua_static` (or `lua_system_shim`) and `pcre2-8` targets, they
+  are reused instead of fetching Lua and PCRE2 again.
 * `cmake --install` installs the binary only (with `THITHER_EMBED_LUA=OFF` also
   `lua/thither` to `share/thither`). The embedded modules add about 70 KB.
 * Operational notes: the loop sleeps in `poll(2)` on stdin (and on stdout
   when output is queued) and on a self-pipe that the dirmonitor thread writes
   to (`src/events.c`), so watch events wake it at once. Child pipes cannot be
   polled, so while an `exec` stream is active the wait is capped at 1-20 ms.
-  An idle server wakes once per second.
+  Watches add no timed wake-ups except to close an open debounce window. An
+  idle server wakes once per second.
 * A shell that prints text in its startup files corrupts any ssh stdio
   protocol; use `ssh -T` with a clean non-interactive environment. The server
   sends nothing before the client's hello.
-
-A fix in `src/api/dirmonitor/inotify.c` (the event walker ignored the name
-length of each inotify event) ships with the server; it also benefits the editor.
 
 ## Tests
 

@@ -235,7 +235,9 @@ static int f_hash_ranges(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
   luaL_checktype(L, 2, LUA_TTABLE);
   const char *want = luaL_optstring(L, 3, NULL);
-  lua_Integer n = luaL_len(L, 2);
+  /* raw length: ops.hash_ranges only passes proper sequences, for which this
+  ** is the same count it checked against its byte cap */
+  lua_Integer n = (lua_Integer) lua_rawlen(L, 2);
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return fail_errno(L, errno);
   struct stat st;
@@ -346,20 +348,36 @@ static int rm_rf_at(int dirfd, const char *name, int depth) {
   return unlinkat(dirfd, name, AT_REMOVEDIR);
 }
 
-/* remove(path, recursive) */
+/* remove(path, recursive)
+** Like rm(1) this refuses the root ("/", "//", ...) and any path whose last
+** component is "." or "..": what gets removed is always one named entry of
+** some directory. Trailing slashes are dropped first, so "link/" removes the
+** symlink instead of following it into its target. */
 static int f_remove(lua_State *L) {
-  const char *path = luaL_checkstring(L, 1);
+  size_t len;
+  const char *arg = luaL_checklstring(L, 1, &len);
   int recursive = lua_toboolean(L, 2);
-  if (!*path || !strcmp(path, "/") || !strcmp(path, ".") || !strcmp(path, ".."))
+  while (len > 0 && arg[len - 1] == '/') len--;
+  if (len == 0) return fail_code(L, "EINVAL", "refusing to remove this path");
+  char *path = strndup(arg, len);
+  if (!path) return fail_errno(L, ENOMEM);
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  if (!strcmp(base, ".") || !strcmp(base, "..")) {
+    free(path);
     return fail_code(L, "EINVAL", "refusing to remove this path");
+  }
   struct stat st;
-  if (lstat(path, &st) < 0) return fail_errno(L, errno);
-  int rc;
-  if (S_ISDIR(st.st_mode))
-    rc = recursive ? rm_rf_at(AT_FDCWD, path, 0) : rmdir(path);
-  else
-    rc = unlink(path);
-  if (rc < 0) return fail_errno(L, errno);
+  int rc = lstat(path, &st);
+  if (rc == 0) {
+    if (S_ISDIR(st.st_mode))
+      rc = recursive ? rm_rf_at(AT_FDCWD, path, 0) : rmdir(path);
+    else
+      rc = unlink(path);
+  }
+  int e = errno;
+  free(path);
+  if (rc < 0) return fail_errno(L, e);
   lua_pushboolean(L, 1);
   return 1;
 }
@@ -951,8 +969,15 @@ static int li_progress(lua_State *L) {
   return 2;
 }
 
+static int li_cancel(lua_State *L) {
+  li_gc(L);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
 static const luaL_Reg li_methods[] = {
   { "step",     li_step     },
+  { "cancel",   li_cancel   },
   { "progress", li_progress },
   { "__gc",     li_gc       },
   { NULL, NULL }

@@ -19,16 +19,33 @@ return function(server)
   end
 
   ops.stat = function(a)
-    return unwrap(serverfs.stat(server.path(a.path), a.nofollow))
+    return unwrap(serverfs.stat(server.path(a.path, a.nofollow), a.nofollow))
   end
+
+  -- upper bound of the msgpack size of one readdir entry without its name and
+  -- link target (12 keys, ints, mtime, etag); the reply stays below this budget
+  local ENTRY_WIRE_BYTES = 256
+  local READDIR_BUDGET = 15 * 1024 * 1024
 
   -- args: path, offset (default 0), limit (default 20000, max 50000)
   -- result: { entries = {...sorted by name...}, total = <entries in dir>, offset = <n>, more = <bool> }
+  -- A slice that would not fit in one frame (long names / symlink targets) is
+  -- cut short: fewer than `limit` entries with more = true, continue at
+  -- offset + #entries.
   ops.readdir = function(a)
     local path = server.path(a.path)
     local offset = int_arg(a.offset, "offset", 0, 0)
     local limit = math.min(int_arg(a.limit, "limit", 20000, 0), 50000)
     local entries, total = unwrap(serverfs.readdir(path, offset, limit))
+    local bytes = 0
+    for i = 1, #entries do
+      local e = entries[i]
+      bytes = bytes + ENTRY_WIRE_BYTES + #e.name + (e.link and #e.link or 0)
+      if bytes > READDIR_BUDGET and i > 1 then
+        for j = #entries, i, -1 do entries[j] = nil end
+        break
+      end
+    end
     return { entries = entries, total = total, offset = offset, more = offset + #entries < total }
   end
 
@@ -54,7 +71,11 @@ return function(server)
     local data = check_data(a.data)
     local mode = a.mode ~= nil and int_arg(a.mode, "mode") or nil
     local w = unwrap(serverfs.writer(path, mode, a.create_dirs and true or false))
-    unwrap(w:write(data))
+    local ok, code, msg = w:write(data)
+    if not ok then
+      w:abort()   -- drops the temp file now rather than at the next GC
+      unwrap(nil, code, msg)
+    end
     return unwrap(w:commit(a.if_match))
   end
 
@@ -117,8 +138,11 @@ return function(server)
     return true
   end
 
+  -- server.path has folded "." / ".." / "//": the only path that names no
+  -- directory entry is "/" (serverfs.remove refuses it as well)
   ops.remove = function(a)
-    local path = server.path(a.path)
+    local path = server.path(a.path, true)
+    if path == "/" then raise("EINVAL", "refusing to remove the filesystem root") end
     if server.root and path == server.root then raise("jail", "cannot remove the server root") end
     unwrap(serverfs.remove(path, a.recursive and true or false))
     return true
@@ -126,7 +150,7 @@ return function(server)
 
   -- args: from, to, overwrite (default true)
   ops.rename = function(a)
-    local from, to = server.path(a.from), server.path(a.to)
+    local from, to = server.path(a.from, true), server.path(a.to, true)
     unwrap(serverfs.rename(from, to, a.overwrite == false))
     return true
   end
@@ -146,13 +170,13 @@ return function(server)
   -- args: target (the link's content, not a path the server resolves), path, overwrite
   ops.symlink = function(a)
     if type(a.target) ~= "string" or a.target == "" then raise("bad_request", "target required") end
-    unwrap(serverfs.symlink(a.target, server.path(a.path), a.overwrite and true or false))
+    unwrap(serverfs.symlink(a.target, server.path(a.path, true), a.overwrite and true or false))
     return true
   end
 
   -- args: from, to, overwrite (hard link)
   ops.link = function(a)
-    local from, to = server.path(a.from), server.path(a.to)
+    local from, to = server.path(a.from), server.path(a.to, true)
     unwrap(serverfs.link(from, to, a.overwrite and true or false))
     return true
   end

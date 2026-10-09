@@ -74,8 +74,11 @@ if(THITHER_DIRMONITOR_BACKEND)
     if(NOT THITHER_DIRMONITOR_BACKEND MATCHES "^(inotify|fsevents|kqueue|dummy)$")
         message(FATAL_ERROR "dirmonitor backend '${THITHER_DIRMONITOR_BACKEND}' is not supported by thither-server")
     endif()
-    set(EC_DIRMONITOR_BACKEND "${THITHER_DIRMONITOR_BACKEND}" CACHE STRING "" FORCE)
 endif()
+# Always forwarded (empty = auto-detect), so clearing THITHER_DIRMONITOR_BACKEND
+# does not leave a stale value in libeditingcore's cache entry.
+set(EC_DIRMONITOR_BACKEND "${THITHER_DIRMONITOR_BACKEND}" CACHE STRING
+    "Set from THITHER_DIRMONITOR_BACKEND (empty = auto)" FORCE)
 set(EC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(editingcore
     GIT_REPOSITORY https://github.com/jsi-textediting/libeditingcore.git

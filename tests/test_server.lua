@@ -27,7 +27,7 @@ H.test("hello: handshake succeeds and reports server capabilities", function()
   H.eq(reply.home, os.getenv("HOME"))
   local caps = {}
   for _, cap in ipairs(reply.caps) do caps[cap] = true end
-  for _, want in ipairs({ "fs", "watch", "exec", "call", "large_file", "search" }) do
+  for _, want in ipairs({ "fs", "watch", "exec", "call", "large_file", "search", "apply_edit_dest" }) do
     H.ok(caps[want], "missing cap " .. want)
   end
   H.eq(c:request("ping", { data = "x" }), "x")
@@ -194,6 +194,29 @@ H.test("root jail: paths outside --root are refused for file ops", function()
   -- exec is not jailed (advisory jail)
   local r = c:request("exec", { argv = { "true" } })
   H.ok(r.stream)
+  c:close()
+end)
+
+H.test("root jail: a symlink in the root pointing outside can be stat'ed, renamed, replaced and removed", function()
+  local dir = U.tmpdir("jaillink")
+  local root = dir .. "/root"
+  U.sh("mkdir -p " .. root .. " " .. dir .. "/outside && echo secret > " .. dir .. "/outside/s.txt")
+  U.sh("ln -s " .. dir .. "/outside " .. root .. "/escape")
+  local c = Client.connect({ args = { "--root", root } })
+  H.eq(c:request("stat", { path = root .. "/escape", nofollow = true }).type, "symlink")
+  local _, err = c:request("stat", { path = root .. "/escape" })
+  H.eq(err.code, "jail", "stat following the link is still jailed")
+  _, err = c:request("stat", { path = root .. "/escape/s.txt", nofollow = true })
+  H.eq(err.code, "jail", "only the last component may be a link out")
+  H.ok(c:request("rename", { from = root .. "/escape", to = root .. "/escape2" }))
+  H.ok(c:request("symlink", { target = dir .. "/outside/s.txt", path = root .. "/escape2", overwrite = true }))
+  H.eq(U.sh("readlink " .. root .. "/escape2"):gsub("%s+$", ""), dir .. "/outside/s.txt")
+  H.ok(c:request("remove", { path = root .. "/escape2/", recursive = true }))
+  H.ok(not U.exists(root .. "/escape2"))
+  H.eq(U.read_file(dir .. "/outside/s.txt"), "secret\n", "the target is untouched")
+  _, err = c:request("remove", { path = root .. "/sub/..", recursive = true })
+  H.eq(err.code, "jail", "the root spelled with ..")
+  H.ok(U.exists(root))
   c:close()
 end)
 

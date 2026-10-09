@@ -12,6 +12,22 @@ The wire protocol is versioned by a single integer (`proto_version`, still
 
 ## Unreleased
 
+### Capability `apply_edit_dest`, fixes (2026-10-09)
+
+* `apply_edit_dest`: advertised by servers whose `apply_edit` supports `dest`
+  and `dest_if_match` (save as); clients gate "save as" on it.
+* `remove` refuses every spelling of `/` (`//`, `/.`, `/a/..`) and any path
+  whose last component is `.` or `..`; paths are normalized lexically with or
+  without `--root`.
+* With `--root`, `remove`, `rename`, `symlink`, `link` (`to`) and
+  `stat{nofollow}` only resolve the parent directory, so symlinks in the root
+  that point outside can be removed, renamed and replaced.
+* `readdir` cuts a slice that would exceed the frame limit short (`more=true`)
+  instead of answering `too_large`.
+* `hash_ranges` rejects `ranges` that are not a list.
+* Temp files of failed `write`s and cancelled `apply_edit`s are removed at
+  once; `stdin` back-pressure and idle watches no longer keep the server busy.
+
 ### Server 0.1.0 (2026-10-08)
 
 * The server is its own project, `thither` (formerly `lite-xl-server`, "lxs"):

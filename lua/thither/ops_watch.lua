@@ -222,7 +222,12 @@ return function(server)
         for _, w in pairs(watches) do note_path(w, id, now) end
       end
     end
-    local hint = 20
+    -- No polling needed while nothing is pending: the dirmonitor thread wakes
+    -- serverio.wait() through the self-pipe (src/events.c) when a change is
+    -- ready, and keeps re-sending the wake-up until monitor:check() above has
+    -- consumed it, so no change is lost between check and flush_events().
+    -- With a debounce window open, wake up when it is due.
+    local hint = nil
     for _, w in pairs(watches) do
       if w.first_at then
         local due = w.first_at + w.debounce
@@ -237,7 +242,8 @@ return function(server)
           end
           w.pending, w.npending, w.overflow, w.first_at = {}, 0, false, nil
         else
-          hint = math.min(hint, math.max(1, math.ceil((due - now) * 1000)))
+          local ms = math.max(1, math.ceil((due - now) * 1000))
+          hint = hint and math.min(hint, ms) or ms
         end
       end
     end

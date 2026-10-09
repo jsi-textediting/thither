@@ -27,7 +27,7 @@ local server = {
   cancel_hooks = {}, -- function(request_id)
   start_hooks = {},  -- function(request_id), before a request with an id starts
   caps = { "fs", "write_stream", "watch", "exec", "call", "large_file", "search", "blob",
-           "fs_meta", "host_info" },
+           "fs_meta", "host_info", "apply_edit_dest" },
 }
 package.loaded["thither"] = server
 
@@ -368,16 +368,27 @@ if opts.root then
   server.root = rp
 end
 
---- Validates and normalizes a client supplied path. With --root the path must
---- stay inside the root, also after resolving symlinks of its existing part.
-function server.path(p)
+--- Validates and normalizes a client supplied path ("." and ".." segments
+--- and repeated or trailing slashes are folded lexically, with or without
+--- --root). With --root the path must stay inside the root, also after
+--- resolving symlinks of its existing part.
+--- nofollow: for ops that act on the final component itself (remove, rename,
+--- symlink, stat{nofollow}): only its parent directory has to resolve inside
+--- the root, so a symlink in the root that points outside can still be
+--- removed or renamed (the op never follows it).
+function server.path(p, nofollow)
   if type(p) ~= "string" or p == "" then server.raise("bad_request", "path must be a non-empty string") end
   if p:find("\0", 1, true) then server.raise("bad_request", "path contains NUL") end
   if p:sub(1, 1) ~= "/" then server.raise("bad_path", "path must be absolute: " .. p) end
-  if not server.root then return p end
   local norm = normalize(p)
+  if not server.root then return norm end
   if not under(norm, server.root) then server.raise("jail", "path is outside the server root") end
   local probe = norm
+  if nofollow and norm ~= server.root then
+    -- the parent is inside the root too: norm is below it, lexically
+    probe = norm:match("^(.*)/[^/]*$")
+    if probe == "" then probe = "/" end
+  end
   while true do
     local rp = serverfs.realpath(probe)
     if rp then

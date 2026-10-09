@@ -158,6 +158,9 @@ H.test("hash_ranges: FNV-1a of each range, stale detection and limits", function
   H.eq(err.code, "too_large")
   _, err = c:request("hash_ranges", { path = dir .. "/f", ranges = { { -1, 5 } } })
   H.ok(err.code == "EINVAL" or err.code == "bad_request", err.code)
+  -- a sparse table must not slip past the size cap
+  _, err = c:request("hash_ranges", { path = dir .. "/f", ranges = { { 0, 10 }, [3] = { 0, 65 * MB } } })
+  H.eq(err and err.code, "bad_request", "sparse ranges")
   U.sh("sleep 0.05; printf X >> " .. dir .. "/f")
   _, err = c:request("hash_ranges", { path = dir .. "/f", ranges = { { 0, 10 } }, etag = li.etag })
   H.eq(err.code, "stale")

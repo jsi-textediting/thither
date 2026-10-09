@@ -35,12 +35,18 @@ return function(server)
   end
 
   --- Runs a C job to completion, yielding to the event loop between steps.
+  --- On cancellation the job is cancelled right away (an edit job removes its
+  --- temp file) instead of being left to the garbage collector.
   local function run_job(req, job)
     while true do
       local r, code, msg = job:step(STEP_BYTES)
       if r == nil then return nil, code, msg end
       if r ~= false then return r end
-      req:yield()
+      local ok, e = pcall(req.yield, req)
+      if not ok then
+        job:cancel()
+        error(e, 0)
+      end
     end
   end
 
@@ -121,8 +127,14 @@ return function(server)
   ops.hash_ranges = function(a)
     local path = server.path(a.path)
     if type(a.ranges) ~= "table" then raise("bad_request", "ranges required") end
+    -- serverfs.hash_ranges hashes ranges 1..#ranges: accept proper sequences
+    -- only, so the cap below counts exactly what gets hashed
+    local n, count = #a.ranges, 0
+    for _ in pairs(a.ranges) do count = count + 1 end
+    if count ~= n then raise("bad_request", "ranges must be a list") end
     local total = 0
-    for _, r in ipairs(a.ranges) do
+    for i = 1, n do
+      local r = a.ranges[i]
       local len = type(r) == "table" and r[2]
       if math.type(len) ~= "integer" or len < 0 then
         raise("bad_request", "a range must be { off, len } with non-negative integers")
