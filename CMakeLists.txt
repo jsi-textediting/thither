@@ -4,15 +4,16 @@
 # From Lite XL: the editor's CMakeLists.txt add_subdirectory()s this when
 #               LITE_BUILD_THITHER is ON and its Lua / PCRE2 targets are reused.
 #
-# POSIX only (Linux, macOS, BSD). No SDL: the few SDL calls in the editor's
-# shared C files resolve to src/compat (pthreads + libc).
+# POSIX only (Linux, macOS, BSD). No SDL: process, regex, dirmonitor and the
+# window-less part of the "system" module come from libeditingcore.
 #
 # Options:
 #   THITHER_STATIC      link fully static (glibc warns about dlopen/getpwuid)
 #   THITHER_EMBED_LUA   compile lua/thither/*.lua into the binary (default ON)
-#   THITHER_LITE_SRC    the Lite XL src/ directory providing system.c,
-#                       process.c, dirmonitor.c and regex.c
-#   THITHER_DIRMONITOR_BACKEND  inotify | fsevents | kqueue | dummy (auto when empty)
+#   THITHER_DIRMONITOR_BACKEND  inotify | fsevents | kqueue | dummy (auto when empty),
+#                       passed to libeditingcore
+#   FETCHCONTENT_SOURCE_DIR_EDITINGCORE  use a local libeditingcore checkout,
+#                       e.g. ../libeditingcore, instead of fetching the tag
 cmake_minimum_required(VERSION 3.21)
 project(thither VERSION 0.1.0 LANGUAGES C)
 
@@ -22,8 +23,6 @@ endif()
 
 option(THITHER_STATIC "Link thither-server statically" OFF)
 option(THITHER_EMBED_LUA "Compile the Lua modules into thither-server" ON)
-set(THITHER_LITE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../lite-xl/src" CACHE PATH
-    "Lite XL src/ directory with the shared system/process/dirmonitor/regex sources")
 set(THITHER_DIRMONITOR_BACKEND "" CACHE STRING
     "dirmonitor backend: inotify | fsevents | kqueue | dummy (auto when empty)")
 
@@ -65,35 +64,24 @@ if(NOT TARGET pcre2-8)
     FetchContent_MakeAvailable(pcre2)
 endif()
 
-# ── dirmonitor backend ─────────────────────────────────────────────────────
-set(_th_dirmon "${THITHER_DIRMONITOR_BACKEND}")
-if(_th_dirmon STREQUAL "")
-    include(CheckIncludeFile)
-    include(CheckFunctionExists)
-    if(APPLE)
-        check_include_file("CoreServices/CoreServices.h" _th_have_cs)
-        set(_th_dirmon "dummy")
-        if(_th_have_cs)
-            set(_th_dirmon "fsevents")
-        endif()
-    else()
-        check_include_file("sys/inotify.h" _th_have_inotify)
-        if(_th_have_inotify)
-            set(_th_dirmon "inotify")
-        else()
-            check_function_exists(kqueue _th_have_kqueue)
-            if(_th_have_kqueue)
-                set(_th_dirmon "kqueue")
-            else()
-                set(_th_dirmon "dummy")
-            endif()
-        endif()
+# ── libeditingcore: process, regex, dirmonitor, system core ────────────────
+# The library takes Lua and PCRE2 from here (targets lua::lua and pcre2-8).
+if(NOT TARGET lua::lua)
+    add_library(lua::lua INTERFACE IMPORTED)
+    target_link_libraries(lua::lua INTERFACE ${_th_lua})
+endif()
+if(THITHER_DIRMONITOR_BACKEND)
+    if(NOT THITHER_DIRMONITOR_BACKEND MATCHES "^(inotify|fsevents|kqueue|dummy)$")
+        message(FATAL_ERROR "dirmonitor backend '${THITHER_DIRMONITOR_BACKEND}' is not supported by thither-server")
     endif()
+    set(EC_DIRMONITOR_BACKEND "${THITHER_DIRMONITOR_BACKEND}" CACHE STRING "" FORCE)
 endif()
-if(NOT _th_dirmon MATCHES "^(inotify|fsevents|kqueue|dummy)$")
-    message(FATAL_ERROR "dirmonitor backend '${_th_dirmon}' is not supported by thither-server")
-endif()
-message(STATUS "thither-server dirmonitor backend: ${_th_dirmon}")
+set(EC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(editingcore
+    GIT_REPOSITORY https://github.com/jsi-textediting/libeditingcore.git
+    GIT_TAG        v0.1.0
+)
+FetchContent_MakeAvailable(editingcore)
 
 # ── embedded Lua modules ───────────────────────────────────────────────────
 set(_th_lua_dir "${CMAKE_CURRENT_SOURCE_DIR}/lua")
@@ -120,37 +108,23 @@ add_custom_command(
 
 # ── thither-server ─────────────────────────────────────────────────────────
 set(_th_src "${CMAKE_CURRENT_SOURCE_DIR}/src")
-set(_lx "${THITHER_LITE_SRC}")
 add_executable(thither-server
     "${_th_src}/main.c"
     "${_th_src}/stdio.c"
     "${_th_src}/fsops.c"
     "${_th_src}/embed.c"
     "${_th_src}/events.c"
-    "${_th_src}/compat/sdl_compat.c"
-    "${_lx}/api/system.c"
-    "${_lx}/api/process.c"
-    "${_lx}/api/regex.c"
-    "${_lx}/api/dirmonitor.c"
-    "${_lx}/api/dirmonitor/${_th_dirmon}.c"
-    "${_lx}/arena_allocator.c"
     "${_th_embed_c}"
 )
 set_target_properties(thither-server PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
-# compat/ first: <SDL3/SDL.h> and "custom_events.h" must resolve to the stand-ins
-target_include_directories(thither-server BEFORE PRIVATE
-    "${_th_src}/compat"
-    "${_th_src}"
-    "${_lx}/api"
-    "${_lx}"
-)
+target_include_directories(thither-server PRIVATE "${_th_src}")
 target_compile_definitions(thither-server PRIVATE
     THITHER
     PCRE2_STATIC
     "THITHER_VERSION_STR=\"${PROJECT_VERSION}\""
 )
 find_package(Threads REQUIRED)
-target_link_libraries(thither-server PRIVATE ${_th_lua} pcre2-8 Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(thither-server PRIVATE editingcore::editingcore ${_th_lua} pcre2-8 Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)
     target_link_options(thither-server PRIVATE -framework CoreServices -framework Foundation)
 else()
@@ -162,7 +136,7 @@ endif()
 if(THITHER_STATIC AND NOT APPLE)
     target_link_options(thither-server PRIVATE -static)
 endif()
-# let the linker drop unused code from Lua, PCRE2 and the shared sources
+# let the linker drop unused code from Lua, PCRE2 and libeditingcore
 target_compile_options(thither-server PRIVATE -ffunction-sections -fdata-sections)
 if(APPLE)
     target_link_options(thither-server PRIVATE -Wl,-dead_strip)

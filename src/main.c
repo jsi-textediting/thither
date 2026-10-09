@@ -1,7 +1,7 @@
 /* thither-server: entry point.
 **
 ** Runs a Lua VM with a few POSIX libraries (some shared with the Lite XL
-** editor: system, process, dirmonitor, regex) and hands control to
+** editor through libeditingcore: system, process, dirmonitor, regex) and hands control to
 ** lua/thither/init.lua, which implements the protocol described in
 ** docs/protocol.md. The Lua modules are normally compiled into the binary
 ** (embed.c); --datadir loads them from a directory instead.
@@ -11,9 +11,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
-#include <SDL3/SDL.h>  /* compat/SDL3/SDL.h: SDL_GetPlatform */
-#include "api.h"
-#include "custom_events.h"
+#include <ec/lua_api.h>
 #include "server.h"
 
 #if defined(__APPLE__)
@@ -46,24 +44,41 @@
   #define THITHER_ARCH_TUPLE ARCH_PROCESSOR "-" ARCH_PLATFORM
 #endif
 
-int luaopen_system(lua_State *L);
-int luaopen_regex(lua_State *L);
-int luaopen_process(lua_State *L);
-int luaopen_dirmonitor(lua_State *L);
+/* "system": the shared, window-less part from libeditingcore */
+static int luaopen_system(lua_State *L) {
+  lua_newtable(L);
+  ec_system_register(L);
+  return 1;
+}
+
+static const char *platform_name(void) {
+#if defined(__APPLE__)
+  return "macOS";
+#elif defined(__linux__)
+  return "Linux";
+#elif defined(__FreeBSD__)
+  return "FreeBSD";
+#elif defined(__OpenBSD__)
+  return "OpenBSD";
+#elif defined(__NetBSD__)
+  return "NetBSD";
+#else
+  return "Unknown";
+#endif
+}
 
 static const luaL_Reg server_libs[] = {
-  { "system",      luaopen_system      },
-  { "regex",       luaopen_regex       },
-  { "process",     luaopen_process     },
-  { "dirmonitor",  luaopen_dirmonitor  },
+  { "system",      luaopen_system         },
+  { "regex",       ec_luaopen_regex       },
+  { "process",     ec_luaopen_process     },
+  { "dirmonitor",  ec_luaopen_dirmonitor  },
   { "serverio",    luaopen_serverio    },
   { "serverfs",    luaopen_serverfs    },
   { "serverembed", luaopen_serverembed },
   { NULL, NULL }
 };
 
-/* also referenced by system.c (native plugin API table) */
-void api_load_libs(lua_State *L) {
+static void api_load_libs(lua_State *L) {
   for (int i = 0; server_libs[i].name; i++)
     luaL_requiref(L, server_libs[i].name, server_libs[i].func, 1);
 }
@@ -209,7 +224,7 @@ int main(int argc, char **argv) {
     lua_rawseti(L, -2, i + 1);
   }
   lua_setglobal(L, "ARGS");
-  lua_pushstring(L, SDL_GetPlatform());   lua_setglobal(L, "PLATFORM");
+  lua_pushstring(L, platform_name());   lua_setglobal(L, "PLATFORM");
   lua_pushstring(L, THITHER_ARCH_TUPLE);  lua_setglobal(L, "ARCH");
   lua_pushstring(L, exename);             lua_setglobal(L, "EXEFILE");
   if (have_datadir) { lua_pushstring(L, datadir); lua_setglobal(L, "DATADIR"); }

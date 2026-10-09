@@ -29,12 +29,11 @@ encryption, and the server lives as long as the session.
 
 ## Build
 
-POSIX only (Linux, macOS, BSD). CMake fetches Lua 5.5 and PCRE2.
+POSIX only (Linux, macOS, BSD). CMake fetches Lua 5.5, PCRE2, and
+[libeditingcore](https://github.com/jsi-textediting/libeditingcore).
 
-The server compiles a few C files from a Lite XL checkout, so clone
-[lite-xl](https://github.com/jsi-textediting/lite-xl) next to this repo
-(`../lite-xl`), or point `THITHER_LITE_SRC` at its `src/` directory (the default is
-`../lite-xl/src`).
+To build against a local checkout of `libeditingcore` instead of fetching the tag,
+pass `-DFETCHCONTENT_SOURCE_DIR_EDITINGCORE=../libeditingcore`.
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -58,15 +57,15 @@ The host's login shell must print nothing in non-interactive sessions.
 | path | contents |
 |---|---|
 | `src/` | entry point, stdio channel, file operations, embedded modules, event pipe |
-| `src/compat/` | the SDL3 subset used by the shared Lite XL sources, on pthreads and libc |
 | `lua/thither/` | protocol handling and ops (embedded into the binary) |
 | `plugins/` | a sample server plugin |
 | `tests/` | the test suite, run by the server itself (`--run tests/run.lua`) |
 | `docs/` | [protocol.md](docs/protocol.md), [CHANGELOG.md](docs/CHANGELOG.md) |
 
-This repo is standalone. It compiles a few of Lite XL's C files
-(`src/api/{system,process,dirmonitor,regex}.c`) from the separate `lite-xl`
-repo through `THITHER_LITE_SRC`. The clients live in their own repos:
+This repo is standalone. It shares native process execution, regex, directory
+monitoring, and system core operations with [Lite XL](https://github.com/jsi-textediting/lite-xl)
+through the static library [libeditingcore](https://github.com/jsi-textediting/libeditingcore).
+The clients live in their own repos:
 `lite-xl-plugins` (Lite XL) and `thither.el` (Emacs).
 
 ## Tests

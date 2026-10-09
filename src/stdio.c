@@ -12,7 +12,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "custom_events.h"
 #include "server.h"
 
 static int proto_in = 0;
