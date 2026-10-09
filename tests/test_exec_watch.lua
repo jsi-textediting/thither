@@ -486,4 +486,63 @@ H.test("watch: errors", function()
   c:close()
 end)
 
+-- Load of the server process from /proc (nil without it): CPU time in clock
+-- ticks and voluntary context switches (each wake-up from poll is one).
+local CLK_TCK = tonumber((U.sh("getconf CLK_TCK")):match("%d+")) or 100
+
+local function load_of(c)
+  local f = io.open("/proc/" .. c.proc:pid() .. "/stat", "rb")
+  if not f then return nil end
+  local stat = f:read("a"); f:close()
+  -- fields after the command name: state is field 3, utime 14, stime 15
+  local fields = {}
+  for x in stat:match("%)%s+(.*)$"):gmatch("%S+") do fields[#fields + 1] = x end
+  local status = U.read_file("/proc/" .. c.proc:pid() .. "/status") or ""
+  return { ticks = tonumber(fields[12]) + tonumber(fields[13]),
+           wakeups = tonumber(status:match("voluntary_ctxt_switches:%s*(%d+)")) }
+end
+
+--- Load of the server over `secs` seconds of the test sleeping.
+local function load_over(c, secs)
+  local a = load_of(c)
+  system.sleep(secs)
+  local b = load_of(c)
+  return { ticks = b.ticks - a.ticks, wakeups = b.wakeups - a.wakeups }
+end
+
+H.test("exec: stdin queued for a child that does not read it does not keep the server busy", function()
+  local c = Client.connect()
+  if not load_of(c) then c:close() print("     (skipped: no /proc)") return end
+  local r = c:request("exec", { argv = { "sleep", "30" } })
+  -- 2 MiB: more than the pipe and the 1 MiB queue, so the last requests wait
+  local chunk = string.rep("y", 256 * 1024)
+  for _ = 1, 8 do c:send_request("stdin", { stream = r.stream, data = mp.bin(chunk) }) end
+  system.sleep(0.3); c:pump()
+  local used = load_over(c, 2)
+  H.ok(used.ticks < CLK_TCK // 2, string.format("server used %d ticks in 2 s waiting to queue stdin", used.ticks))
+  H.eq(c:request("ping", { data = 1 }, 5), 1, "still responsive")
+  c:request("kill", { stream = r.stream, signal = "kill" })
+  H.ok(exit_of(c, r.stream, 5), "child did not exit")
+  c:close()
+end)
+
+H.test("watch: an idle watch does not wake the server, changes are still reported", function()
+  local dir = U.tmpdir("watch-idle")
+  local c = Client.connect()
+  if not load_of(c) then c:close() print("     (skipped: no /proc)") return end
+  local w = c:request("watch", { path = dir, debounce_ms = 30 })
+  system.sleep(0.2); c:pump()
+  local idle = load_over(c, 2)
+  -- a 20 ms ticker would wake it about 100 times
+  H.ok(idle.wakeups < 20, string.format("server woke %d times in 2 s with an idle watch", idle.wakeups))
+  U.write_file(dir .. "/a.txt", "1")
+  local ev = watch_event(c, w.watch, 2)
+  H.ok(ev and ev.ev == "watch", "no event after the idle period")
+  H.eq(ev.paths, { dir })
+  -- the debounce window still closes on time without a ticker
+  for i = 1, 20 do U.write_file(dir .. "/f" .. i, "x") end
+  H.ok(watch_event(c, w.watch, 2), "no event for a burst after the idle period")
+  c:close()
+end)
+
 H.test("cleanup: exec/watch tests", function() U.cleanup() end)

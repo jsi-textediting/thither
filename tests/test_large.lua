@@ -773,4 +773,21 @@ H.test("large: a multi-GB sparse file is indexed instantly; oversized chunk tabl
   c:close()
 end)
 
+H.test("large: a cancelled apply_edit leaves the source untouched and no temp file", function()
+  local dir = U.tmpdir("cancel-edit")
+  local path = dir .. "/f"
+  U.sh("yes 'line for the cancelled apply_edit test' | head -c " .. (256 * MB) .. " > " .. U.shq(path))
+  local c = connect()
+  local li = c:request("lineindex", { path = path, chunk_size = 65536 }, 120)
+  local id = c:send_request("apply_edit", { path = path, etag = li.etag, inserts = { "head\n" },
+    script = { { ins = 1 }, { keep = true, off = 0, len = 256 * MB } } })
+  c:send({ cancel = id })
+  local r, err = c:wait_response(id, 120)
+  H.ok(not r and err.code == "cancelled", "expected cancelled, got " .. tostring(r and "ok" or err.code))
+  H.eq(c:request("stat", { path = path }).etag, li.etag, "the source is untouched")
+  H.eq(U.ls(dir), { "f" }, "no temp file left behind")
+  H.eq(c:request("ping", { data = 1 }), 1)
+  c:close()
+end)
+
 H.test("cleanup: large tests", function() U.cleanup() end)
