@@ -2,13 +2,11 @@
 
 Status (2026-10-09):
 
-- **Phases 0-2 are implemented on the server.** That is the multi-connection
-  core, `serverio` sockets/poll, `serverpty`, and the session daemon and
-  relay (`87b9566`, merged in `b88e5bb`, reviewed and fixed afterwards).
-  A few items in phases 0-2 are still open.
+- **Phases 0-2 are fully implemented on the server.** That is the multi-connection
+  core, `serverio` sockets/poll/shutdown, `serverpty` (PTY and pipe modes), the session
+  daemon and relay, environment forwarding, and all review follow-up tasks.
 - **Phases 3-6 are not started.** That covers procs, the clients and polish.
-- See [Implementation status](#implementation-status) for what is done and
-  left in each phase.
+- See [Implementation status](#implementation-status) for what is done in each phase.
 
 The plan was also revised for the repository split, libeditingcore, the
 embedded modules and the 2026-10-09 server fixes (see
@@ -854,16 +852,13 @@ fixes on top of it.
 - Hooks: `on_connect` / `on_disconnect`, `on_root(path, conn)`, and
   `server.notify(event, data, conn)`. They are documented in `protocol.md`
   and the `plugins.lua` header.
+- Plugins: `plugins/echo.lua` audited and updated for per-connection API.
 - Tests: two connections, a jail per connection, the 2026-10-09 path rules
   (`nofollow`, `..`, `remove` of the root) through daemon connections, a
-  project root per connection, and cleanup when a connection closes.
+  project root per connection, cleanup when a connection closes, and
+  targeted `server.notify` / hooks.
 
-Left:
-
-- Audit `plugins/echo.lua` and any external plugins for the per-connection
-  API.
-
-### Phase 1: serverio and serverpty. Done, with gaps
+### Phase 1: serverio and serverpty. Done
 
 - `serverio`:
   - `listen` / `accept` / `connect`, each checking the peer uid with
@@ -872,28 +867,23 @@ Left:
     timeouts and includes the event pipe;
   - `lock` / `unlock`;
   - `daemonize`, which reports fork and exec failures through an errno pipe;
-  - errno codes for `accept` errors.
+  - errno codes for `accept` errors;
+  - `environ()` returning process environment and `shutdown(fd, how)` (`"r"`, `"w"`, `"rw"`).
 - `serverpty.open` / `resize` / `reap` / `signal` / `fg_pgrp` / `proc_cwd` /
   `proc_name`:
   - exec failures are reported;
   - the child starts with default signal dispositions and an empty mask;
   - the environment is built before `fork`;
   - `close_range` falls back to a loop on old kernels;
-  - array-style `env` is accepted.
+  - array-style `env` is accepted;
+  - `open{tty=false}` pipe mode (pipes with stdout and stderr merged, child in
+    its own process group, stdin connected to `/dev/null`).
+- Build checks: `CMakeLists.txt` detects `close_range` and `ptsname_r` via
+  `check_symbol_exists` (`HAVE_CLOSE_RANGE`, `HAVE_PTSNAME_R`).
+- Socket type: `serverfs.stat` reports sockets as `type="socket"` for `S_ISSOCK`.
 - The static build passes the same tests.
 
-Left:
-
-- **Pipe mode.** `serverpty.open{tty=false}` (pipes with stdout and stderr
-  merged, in its own process group) is not implemented. Phase 3 jobs need it.
-- **Build checks.** `CMakeLists.txt` has no `close_range` / `ptsname_r`
-  checks. The code relies on `#ifdef`s and runtime fallbacks.
-- **Socket type.** `serverfs.stat` reports sockets as `type="other"`, the
-  same as FIFOs and devices. The session socket checks accept "other" plus
-  the owner check. Report `S_ISSOCK` as "socket" in `fsops.c` to make them
-  exact.
-
-### Phase 2: daemon, relay, lifecycle. Done, with gaps
+### Phase 2: daemon, relay, lifecycle. Done
 
 - Flags: `--session`, `--daemon`, `--kill` (5 s deadline), `--idle-exit`
   (clean shutdown) and `--retain-exited`.
@@ -902,50 +892,38 @@ Left:
   - owner, mode and symlink checks: a wrong existing directory is refused,
     not `chmod`ed;
   - the socket path is checked to be our own socket before connect or
-    remove.
-  - `daemon.log` rotates at 1 MiB.
+    remove;
+  - `daemon.log` rotates at 1 MiB;
+  - NSS-free directory resolution (checks `$USER` / `$LOGNAME` before `getpwuid`).
 - Relay:
   - start-up under `flock`;
   - the preamble / `relay_ok` handshake: a bad preamble is refused for that
     connection only and never ends the daemon;
+  - forwards environment (`SSH_*`, `LC_*`, `DISPLAY`, `WAYLAND_DISPLAY`,
+    `TERM`, `TERM_PROGRAM`, `COLORTERM`, `LANG`) and configurable `--forward-env`;
+  - forwards preamble options: `--root`, per-connection request `--log`, and
+    `--plugins` mismatch reporting;
+  - version skew checks on both sides comparing version and `build_id`;
+  - half-close via `serverio.shutdown(sock, "w")` after stdin EOF;
   - a raw byte copy without busy polling;
   - replies in flight are delivered after stdin EOF.
 - Daemon:
   - the hello `session` table, `host_info.session_name`, `session_info` and
     `session_shutdown`;
   - `session_closing` is delivered at shutdown, with a bounded drain;
-  - backs off on `accept` errors.
+  - backs off on `accept` errors (`EMFILE`);
+  - `SIGTERM` shuts down cleanly.
 - `agent.sock` only ever points at a socket owned by the current uid.
+- Documentation: `session_info` / `session_shutdown` and hello `session` table
+  documented in op tables in `docs/protocol.md`.
 - Tests:
   - relay start, many relays started at once giving one daemon, the daemon
     surviving a relay kill, stale socket recovery;
   - a refused `0755` directory, refused bad preambles, symlinked roots;
   - an idle relay that does not spin, delivery after stdin EOF, `--kill`
-    timeouts, a clean idle exit, and the agent symlink.
+    timeouts, clean idle exit, `SIGTERM` shutdown, accept back-off, and the agent symlink;
+  - per-connection `--log`, `--plugins` mismatch, version skew, extended env forwarding.
 - The `--session` section of `docs/protocol.md` and the CHANGELOG entry.
-
-Left:
-
-- **Environment subset.** The relay forwards `SSH_*`, `TERM`, `LANG` and
-  `LC_ALL` only. The plan's list also has `DISPLAY`, `WAYLAND_DISPLAY`,
-  `TERM_PROGRAM`, `COLORTERM` and every `LC_*`, and should be configurable.
-- **Preamble options.** Only `root` is applied per connection. `--log` (the
-  per-connection request log) and the `--plugins` mismatch report are not.
-- **Version skew.**
-  - The daemon compares the relay's `relay_version` only. It should also
-    compare `build_id`, and the relay should compare `relay_ok.daemon_version`.
-  - The `session.version_skew` string should carry the build id.
-- **Relay half-close.** `serverio` has no `shutdown()`. After stdin EOF the
-  relay waits for 1 s of quiet (10 s at most) instead of half-closing the
-  socket.
-- **Missing tests.** `SIGTERM` to the daemon shuts it down cleanly. The
-  back-off after an `accept` error (needs EMFILE).
-- **NSS-free paths.** The runtime and state dirs use `serverfs.ids().uid` and
-  `serverfs.home()`. Check that neither depends on `getpwuid` in the static
-  build when `$HOME` is set.
-- **Protocol op table.** `session_info` / `session_shutdown` and the hello
-  `session` table are described in the `--session` section, but have no rows
-  in the op tables.
 
 ### Phases 3-6. Not started
 

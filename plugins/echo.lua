@@ -10,8 +10,16 @@ server.on_start(function(ctx)
   server.log("echo plugin ready (server %s)", ctx.version)
 end)
 
-server.on_root(function(path)
-  server.log("echo plugin: project root is %s", path)
+server.on_connect(function(conn)
+  server.log("echo plugin: connection %d attached", conn.id)
+end)
+
+server.on_disconnect(function(conn)
+  server.log("echo plugin: connection %d disconnected", conn.id)
+end)
+
+server.on_root(function(path, conn)
+  server.log("echo plugin: project root is %s (conn %s)", path, conn and tostring(conn.id) or "default")
 end)
 
 server.register("echo", {

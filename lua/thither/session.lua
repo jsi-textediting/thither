@@ -58,7 +58,7 @@ end
 function session.check_socket(path)
   local st = serverfs.stat(path, true)
   if not st then return true, "absent" end
-  if st.is_link or (st.type ~= "socket" and st.type ~= "other") then
+  if st.is_link or st.type ~= "socket" then
     return nil, "not a socket: " .. tostring(path)
   end
   if st.uid ~= serverfs.ids().uid then

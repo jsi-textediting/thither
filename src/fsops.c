@@ -78,6 +78,9 @@ static const char *type_name(mode_t m) {
   if (S_ISREG(m)) return "file";
   if (S_ISDIR(m)) return "dir";
   if (S_ISLNK(m)) return "symlink";
+#ifdef S_ISSOCK
+  if (S_ISSOCK(m)) return "socket";
+#endif
   return "other";
 }
 
@@ -535,8 +538,14 @@ static int f_ids(lua_State *L) {
   }
   free(g);
   lua_setfield(L, -2, "gids");
-  struct passwd *pw = getpwuid(getuid());
-  if (pw && pw->pw_name) { lua_pushstring(L, pw->pw_name); lua_setfield(L, -2, "user"); }
+  const char *u = getenv("USER");
+  if (!u || !*u) u = getenv("LOGNAME");
+  if (u && *u) {
+    lua_pushstring(L, u); lua_setfield(L, -2, "user");
+  } else {
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_name) { lua_pushstring(L, pw->pw_name); lua_setfield(L, -2, "user"); }
+  }
   return 1;
 }
 

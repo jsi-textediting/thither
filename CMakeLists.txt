@@ -121,11 +121,17 @@ add_executable(thither-server
     "${_th_embed_c}"
 )
 set_target_properties(thither-server PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(close_range "unistd.h" HAVE_CLOSE_RANGE)
+check_symbol_exists(ptsname_r "stdlib.h" HAVE_PTSNAME_R)
 target_include_directories(thither-server PRIVATE "${_th_src}")
 target_compile_definitions(thither-server PRIVATE
     THITHER
     PCRE2_STATIC
     "THITHER_VERSION_STR=\"${PROJECT_VERSION}\""
+    $<$<BOOL:${HAVE_CLOSE_RANGE}>:HAVE_CLOSE_RANGE>
+    $<$<BOOL:${HAVE_PTSNAME_R}>:HAVE_PTSNAME_R>
 )
 find_package(Threads REQUIRED)
 target_link_libraries(thither-server PRIVATE editingcore::editingcore ${_th_lua} pcre2-8 Threads::Threads ${CMAKE_DL_LIBS})

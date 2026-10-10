@@ -139,6 +139,7 @@ static void usage(FILE *f) {
     "  --retain-exited <sec> Time to retain exited process buffers (default 3600)\n"
     "  --root <dir>        Restrict non-exec file operations to <dir>\n"
     "  --log <file>        Append a request log to <file>\n"
+    "  --forward-env <vars> Extra environment variables/patterns to forward\n"
     "  --plugins <dir>     Load server plugins from <dir> (repeatable)\n"
     "  --datadir <dir>     Load thither/*.lua from <dir>\n"
     "                      (in front of the modules built into the binary)\n"
@@ -154,7 +155,7 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
 
   const char *datadir_opt = NULL, *root = NULL, *logfile = NULL, *run_script = NULL;
-  const char *session = NULL;
+  const char *session = NULL, *forward_env = NULL;
   int is_daemon = 0, is_kill = 0, idle_exit = 600, retain_exited = 3600;
   const char *plugins[64];
   int nplugins = 0, run_first_arg = 0;
@@ -195,6 +196,8 @@ int main(int argc, char **argv) {
       root = argv[++i];
     } else if (!strcmp(a, "--log") && i + 1 < argc) {
       logfile = argv[++i];
+    } else if (!strcmp(a, "--forward-env") && i + 1 < argc) {
+      forward_env = argv[++i];
     } else if (!strcmp(a, "--plugins") && i + 1 < argc) {
       if (nplugins < 64) plugins[nplugins++] = argv[i + 1];
       i++;
@@ -264,6 +267,10 @@ int main(int argc, char **argv) {
   if (session) {
     lua_pushstring(L, session);
     lua_setfield(L, -2, "session");
+  }
+  if (forward_env) {
+    lua_pushstring(L, forward_env);
+    lua_setfield(L, -2, "forward_env");
   }
   if (is_daemon) {
     lua_pushboolean(L, 1);

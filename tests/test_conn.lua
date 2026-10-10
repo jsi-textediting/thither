@@ -29,6 +29,7 @@ local function create_mock_conn(id, opts)
 
   local conn = server.Conn.new(id, copts)
   table.insert(server.connections, conn)
+  for _, fn in ipairs(server.hooks.on_connect) do fn(conn) end
 
   local mock = {
     conn = conn,
@@ -273,3 +274,48 @@ H.test("conn: server.send outside a request is dropped in daemon mode", function
   H.eq(c1:recv(), nil, "no connection gets a message meant for none")
   c1:close()
 end)
+
+H.test("conn: on_connect, on_disconnect and targeted server.notify", function()
+  local server = require "thither"
+  local connected, disconnected = {}, {}
+  local function on_conn(c) table.insert(connected, c) end
+  local function on_disconn(c) table.insert(disconnected, c) end
+  server.on_connect(on_conn)
+  server.on_disconnect(on_disconn)
+
+  local c1 = create_mock_conn(701)
+  H.eq(#connected, 1)
+  H.eq(connected[1], c1.conn)
+
+  local c2 = create_mock_conn(702)
+  H.eq(#connected, 2)
+  H.eq(connected[2], c2.conn)
+
+  c1:feed({ ev = "hello", proto_version = server.proto_version })
+  c2:feed({ ev = "hello", proto_version = server.proto_version })
+  c1:step(); c2:step(); c1:recv(); c2:recv()
+
+  -- targeted notification to c1 only
+  server.notify("test_event", { target = "c1" }, c1.conn)
+  local m1 = c1:recv()
+  local m2 = c2:recv()
+  H.ok(m1 and m1.ev == "notify" and m1.data and m1.data.target == "c1", "c1 gets targeted notification")
+  H.eq(m2, nil, "c2 does not get notification targeted to c1")
+
+  c1:close()
+  H.eq(#disconnected, 1)
+  H.eq(disconnected[1], c1.conn)
+
+  c2:close()
+  H.eq(#disconnected, 2)
+  H.eq(disconnected[2], c2.conn)
+
+  -- remove test hooks
+  for i = #server.hooks.on_connect, 1, -1 do
+    if server.hooks.on_connect[i] == on_conn then table.remove(server.hooks.on_connect, i) end
+  end
+  for i = #server.hooks.on_disconnect, 1, -1 do
+    if server.hooks.on_disconnect[i] == on_disconn then table.remove(server.hooks.on_disconnect, i) end
+  end
+end)
+

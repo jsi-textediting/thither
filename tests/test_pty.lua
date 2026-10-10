@@ -170,3 +170,39 @@ H.test("serverpty: env accepts array-style entries and skips odd keys", function
   wait_exit(res.pid)
   serverio.close(res.master)
 end)
+
+H.test("serverpty: pipe mode (tty=false) merges stdout and stderr", function()
+  local res, err = serverpty.open({
+    argv = { "sh", "-c", 'echo from_stdout; echo from_stderr >&2' },
+    tty = false,
+  })
+  H.ok(res, "serverpty.open with tty=false failed: " .. tostring(err))
+  H.eq(res.tty, false)
+  H.ok(res.master > 0)
+  H.ok(res.fd == res.master)
+
+  local out = read_pty(res.master, "from_stderr")
+  H.ok(out:find("from_stdout"), "should contain stdout: " .. tostring(out))
+  H.ok(out:find("from_stderr"), "should contain stderr: " .. tostring(out))
+
+  -- Resize on a pipe descriptor fails
+  local r_ok, r_err = serverpty.resize(res.master, 100, 30)
+  H.eq(r_ok, nil, "resize on pipe should fail")
+  H.ok(r_err ~= nil)
+
+  H.eq(wait_exit(res.pid), 0)
+  serverio.close(res.master)
+end)
+
+H.test("serverpty: pipe mode process group receives signal", function()
+  local res, err = serverpty.open({
+    argv = { "sh", "-c", 'sleep 30' },
+    tty = false,
+  })
+  H.ok(res)
+  H.ok(serverpty.signal(res.pid, "term"))
+  local code, killed = wait_exit(res.pid)
+  H.ok(code == 143 or killed == true, "child should be terminated by signal")
+  serverio.close(res.master)
+end)
+

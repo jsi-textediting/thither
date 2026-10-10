@@ -181,6 +181,37 @@ if not sock_fd then
   return 1
 end
 
+local function collect_env(forward_opt)
+  local full = serverio.environ and serverio.environ() or {}
+  local extra_patterns = {}
+  if forward_opt then
+    for item in forward_opt:gmatch("[^,]+") do
+      local p = item:match("^%s*(.-)%s*$")
+      if #p > 0 then
+        local lua_pat = "^" .. p:gsub("([%^%$%(%)%%%.%[%]%+%-])", "%%%1"):gsub("%*", ".*") .. "$"
+        table.insert(extra_patterns, lua_pat)
+      end
+    end
+  end
+
+  local res = {}
+  for k, v in pairs(full) do
+    local match = false
+    if k:match("^SSH_") then match = true
+    elseif k:match("^LC_") then match = true
+    elseif k == "DISPLAY" or k == "WAYLAND_DISPLAY" then match = true
+    elseif k == "TERM" or k == "TERM_PROGRAM" or k == "COLORTERM" then match = true
+    elseif k == "LANG" then match = true
+    else
+      for _, p in ipairs(extra_patterns) do
+        if k:match(p) then match = true; break end
+      end
+    end
+    if match then res[k] = v end
+  end
+  return res
+end
+
 -- Preamble handshake. A relative --root is made absolute here: the daemon
 -- runs in another directory (it keeps the spelling, the daemon realpaths it).
 local popts = {}
@@ -192,16 +223,9 @@ end
 local preamble = {
   ev = "relay",
   relay_version = SERVER_VERSION,
+  build_id = SERVER_BUILD,
   pid = system.get_process_id(),
-  env = {
-    SSH_AUTH_SOCK = os.getenv("SSH_AUTH_SOCK"),
-    SSH_CONNECTION = os.getenv("SSH_CONNECTION"),
-    SSH_CLIENT = os.getenv("SSH_CLIENT"),
-    SSH_TTY = os.getenv("SSH_TTY"),
-    TERM = os.getenv("TERM"),
-    LANG = os.getenv("LANG"),
-    LC_ALL = os.getenv("LC_ALL"),
-  },
+  env = collect_env(opts.forward_env),
   opts = popts,
 }
 
@@ -229,25 +253,34 @@ if msg.err then
     err = { code = tostring(e.code or "relay_refused"), msg = tostring(e.msg or e.code) } }), 1000)
   return 2
 end
+if msg.daemon_plugins and opts.plugins then
+  local p1 = table.concat(opts.plugins, ",")
+  local p2 = table.concat(msg.daemon_plugins, ",")
+  if p1 ~= p2 then
+    io.stderr:write("thither-server: session plugins differ from requested plugins\n")
+  end
+end
 
 -- Bidirectional raw byte pump loop. fd 0/1 in the poll set and the fd-less
 -- read/write name the protocol channel (serverio keeps the real stdio there).
 local MAX_BUF = 262144
 local DRAIN_IDLE = 1      -- after stdin EOF: wait this long for more daemon output
-local DRAIN_MAX = 10      -- ... but no longer than this in total
+local DRAIN_MAX = 1       -- shutdown(SHUT_WR) cuts the drain wait to at most 1s
 local in_buf = ""
 local out_buf = r:unread_bytes()
 local stdin_eof = false
 local sock_eof = false
+local half_closed = false
 local drain_start, drain_last
 
 local function has(ev, ch) return ev ~= nil and ev:find(ch, 1, true) ~= nil end
 
 while true do
-  -- stdin is done and everything it sent reached the daemon: there is no
-  -- shutdown(SHUT_WR) in serverio, so give the daemon a bounded time to
-  -- answer what is in flight, then go
-  if stdin_eof and #in_buf == 0 and not drain_start then
+  -- stdin is done and everything it sent reached the daemon: half-close the
+  -- write half of the socket, then wait at most 1s for the daemon to answer
+  if stdin_eof and #in_buf == 0 and not half_closed then
+    serverio.shutdown(sock_fd, "w")
+    half_closed = true
     drain_start, drain_last = now(), now()
   end
   if sock_eof and #out_buf == 0 then break end

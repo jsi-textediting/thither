@@ -235,12 +235,24 @@ local function info(conn)
     max_frame = server.max_frame,
   }
   if server.is_daemon then
+    local skew = nil
+    if conn then
+      local v_diff = conn.relay_version and conn.relay_version ~= server.version
+      local b_diff = conn.relay_build and conn.relay_build ~= "" and server.build_id and server.build_id ~= "" and conn.relay_build ~= server.build_id
+      if v_diff or b_diff then
+        if conn.relay_build and conn.relay_build ~= "" then
+          skew = string.format("%s (%s)", conn.relay_version or server.version, conn.relay_build)
+        else
+          skew = conn.relay_version or server.version
+        end
+      end
+    end
     res.session = {
       name = opts.session or "default",
       daemon_pid = system.get_process_id(),
       started = server.started_at,
       version = server.version,
-      version_skew = (conn and conn.relay_version and conn.relay_version ~= server.version) and conn.relay_version or nil,
+      version_skew = skew,
       plugins = opts.plugins or {},
       connections = #server.connections,
     }
@@ -384,6 +396,11 @@ function Conn:enqueue(data)
 end
 
 function Conn:send(msg)
+  if self.logfh and msg.id ~= nil then
+    local ok_res = msg.ok ~= nil and "ok" or (msg.err and ("err " .. tostring(msg.err.code)) or "done")
+    self.logfh:write(os.date("%Y-%m-%d %H:%M:%S "), string.format("rep %s %s\n", tostring(msg.id), ok_res))
+    self.logfh:flush()
+  end
   local ok, data = pcall(frame.encode, msg)
   if not ok then
     if msg.id then
@@ -429,6 +446,10 @@ end
 function Conn:close()
   if self.closed then return end
   self.closed = true
+  if self.logfh then
+    pcall(function() self.logfh:close() end)
+    self.logfh = nil
+  end
   for _, req in pairs(self.requests) do
     req.cancelled = true
   end
@@ -449,7 +470,7 @@ server.current_conn = nil
 local function is_own_socket(path)
   if type(path) ~= "string" or path:sub(1, 1) ~= "/" then return false end
   local st = serverfs.stat(path)
-  if not st or (st.type ~= "socket" and st.type ~= "other") then return false end
+  if not st or st.type ~= "socket" then return false end
   return st.uid == serverfs.ids().uid
 end
 server.is_own_socket = is_own_socket
@@ -687,6 +708,10 @@ local function handle_request(conn, msg)
     return
   end
   server.log("req %s %s", tostring(id), op)
+  if conn and conn.logfh then
+    conn.logfh:write(os.date("%Y-%m-%d %H:%M:%S "), string.format("req %s %s\n", tostring(id), op))
+    conn.logfh:flush()
+  end
   start_request(conn, id, op, handler, args)
 end
 
@@ -725,13 +750,33 @@ function Conn:handle_frame(msg)
       end
       self.relay_info = msg
       self.relay_version = msg.relay_version
+      self.relay_build = msg.build_id or msg.relay_build
       self.env = env
       if root then self.root, self.root_alias = root, alias end
+      if msg.opts and msg.opts.log and type(msg.opts.log) == "string" then
+        if self.logfh then self.logfh:close() end
+        self.log_file = msg.opts.log
+        local lfh = io.open(msg.opts.log, "ab")
+        if lfh then
+          serverfs.set_cloexec(lfh)
+          self.logfh = lfh
+        end
+      end
+      if msg.opts and msg.opts.plugins and type(msg.opts.plugins) == "table" then
+        local p_req = table.concat(msg.opts.plugins, ",")
+        local p_cur = table.concat(opts.plugins or {}, ",")
+        if p_req ~= p_cur then
+          server.log("connection %d: requested plugins (%s) differ from daemon plugins (%s)",
+            self.id, p_req, p_cur)
+        end
+      end
       if server.update_agent_symlink then server.update_agent_symlink() end
       self:send({
         ev = "relay_ok",
         daemon_version = server.version,
+        daemon_build = server.build_id,
         daemon_pid = system.get_process_id(),
+        daemon_plugins = opts.plugins or {},
         session = opts.session or "default",
       })
       return true

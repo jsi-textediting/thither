@@ -167,6 +167,117 @@ static int f_pty_open(lua_State *L) {
   char **c_env = build_env(L, env_idx, anchor, term);
   lua_pop(L, 1); /* pop env */
 
+  /* Optional tty: default true */
+  int is_tty = 1;
+  lua_getfield(L, 1, "tty");
+  if (!lua_isnil(L, -1)) is_tty = lua_toboolean(L, -1);
+  lua_pop(L, 1);
+
+  if (!is_tty) {
+    int outpipe[2];
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (pipe2(outpipe, O_CLOEXEC) != 0) {
+#else
+    if (pipe(outpipe) != 0) {
+#endif
+      return push_err(L, errno);
+    }
+#if !defined(__linux__) || !defined(O_CLOEXEC)
+    fcntl(outpipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(outpipe[1], F_SETFD, FD_CLOEXEC);
+#endif
+    outpipe[1] = server_fd_above_stdio(outpipe[1]);
+
+    int errpipe[2];
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (pipe2(errpipe, O_CLOEXEC) != 0) {
+#else
+    if (pipe(errpipe) != 0) {
+#endif
+      int err = errno;
+      close(outpipe[0]);
+      close(outpipe[1]);
+      return push_err(L, err);
+    }
+#if !defined(__linux__) || !defined(O_CLOEXEC)
+    fcntl(errpipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(errpipe[1], F_SETFD, FD_CLOEXEC);
+#endif
+    errpipe[1] = server_fd_above_stdio(errpipe[1]);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      int err = errno;
+      close(outpipe[0]);
+      close(outpipe[1]);
+      close(errpipe[0]);
+      close(errpipe[1]);
+      return push_err(L, err);
+    }
+
+    if (pid == 0) {
+      server_child_reset_signals();
+      close(outpipe[0]);
+      close(errpipe[0]);
+
+      setsid();
+
+      int null_fd = open("/dev/null", O_RDONLY);
+      if (null_fd >= 0) {
+        dup2(null_fd, 0);
+        if (null_fd > 0) close(null_fd);
+      }
+
+      dup2(outpipe[1], 1);
+      dup2(outpipe[1], 2);
+      if (outpipe[1] > 2) close(outpipe[1]);
+
+      if (cwd && chdir(cwd) != 0) {
+        int e = errno;
+        ssize_t w = write(errpipe[1], &e, sizeof(e)); (void) w;
+        _exit(127);
+      }
+
+      server_close_fds_from(3, errpipe[1]);
+
+      environ = c_env;
+      execvp(c_argv[0], c_argv);
+      int e = errno;
+      ssize_t w = write(errpipe[1], &e, sizeof(e)); (void) w;
+      _exit(127);
+    }
+
+    /* Parent process */
+    close(errpipe[1]);
+    close(outpipe[1]);
+    int child_err = 0;
+    ssize_t nr;
+    do nr = read(errpipe[0], &child_err, sizeof(child_err)); while (nr < 0 && errno == EINTR);
+    close(errpipe[0]);
+
+    if (nr > 0) {
+      close(outpipe[0]);
+      while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+      lua_pushnil(L);
+      lua_pushstring(L, strerror(child_err));
+      lua_pushstring(L, server_errno_name(child_err));
+      return 3;
+    }
+
+    fcntl(outpipe[0], F_SETFL, fcntl(outpipe[0], F_GETFL) | O_NONBLOCK);
+
+    lua_newtable(L);
+    lua_pushinteger(L, outpipe[0]);
+    lua_setfield(L, -2, "master");
+    lua_pushinteger(L, outpipe[0]);
+    lua_setfield(L, -2, "fd");
+    lua_pushinteger(L, pid);
+    lua_setfield(L, -2, "pid");
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "tty");
+    return 1;
+  }
+
   /* Open master PTY */
   int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (master < 0) {
@@ -180,7 +291,13 @@ static int f_pty_open(lua_State *L) {
   }
 
   char slavename[256];
-#if defined(__APPLE__)
+#if defined(HAVE_PTSNAME_R)
+  if (ptsname_r(master, slavename, sizeof(slavename)) != 0) {
+    int err = errno;
+    close(master);
+    return push_err(L, err);
+  }
+#else
   static pthread_mutex_t pts_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&pts_lock);
   char *pts = ptsname(master);
@@ -193,12 +310,6 @@ static int f_pty_open(lua_State *L) {
   strncpy(slavename, pts, sizeof(slavename) - 1);
   slavename[sizeof(slavename) - 1] = '\0';
   pthread_mutex_unlock(&pts_lock);
-#else
-  if (ptsname_r(master, slavename, sizeof(slavename)) != 0) {
-    int err = errno;
-    close(master);
-    return push_err(L, err);
-  }
 #endif
 
   int errpipe[2];
@@ -303,8 +414,12 @@ static int f_pty_open(lua_State *L) {
   lua_newtable(L);
   lua_pushinteger(L, master);
   lua_setfield(L, -2, "master");
+  lua_pushinteger(L, master);
+  lua_setfield(L, -2, "fd");
   lua_pushinteger(L, pid);
   lua_setfield(L, -2, "pid");
+  lua_pushboolean(L, 1);
+  lua_setfield(L, -2, "tty");
   return 1;
 }
 

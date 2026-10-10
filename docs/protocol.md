@@ -78,10 +78,16 @@ client -> { ev="hello", proto_version=1, client_version="...", caps={...} }
 server -> { ev="hello", server_version="2.1.7", build_id="07032848c4a3", proto_version=1, pid=..., platform="Linux",
             arch="x86_64-linux", home="/home/u", root=<jail root or absent>, cwd="/...",
             services={"echo",...}, caps={"fs","write_stream","watch","exec","call",
-            "large_file","search","blob","fs_meta","host_info","apply_edit_dest"},
+            "large_file","search","blob","fs_meta","host_info","apply_edit_dest","session"},
             max_frame=16777216 }
 ```
 
+* In daemon mode (`--session`, `session` cap), `session` is added to the hello reply:
+  ```
+  session = { name="default", daemon_pid=..., started=<unix time>, version="...",
+              version_skew=<relay version or absent>, plugins={...},
+              connections=<n including this one> }
+  ```
 * The protocol version is a single integer; the server speaks exactly `1`. Any
   other value is refused: `{ev="hello", proto_version=1, server_version=...,
   err={code="version_mismatch", msg=...}}`, then the server exits with status 2.
@@ -210,6 +216,8 @@ Symlinks are followed (the table describes the target and carries
 | `watch` / `unwatch` | see [Events](#events) | |
 | `exec`, `stdin`, `stdin_close`, `kill`, `ack` | see [Events](#events) | |
 | `call` | `service`, `method`, `args` | whatever the plugin method returns |
+| `session_info` | - | `{name, daemon_pid, started, version, version_skew, plugins, connections}` in daemon mode (`session` cap); `bad_request` in stdio mode |
+| `session_shutdown` | `timeout_ms=2000` | `true`, then daemon broadcasts `{ev="session_closing"}`, drains and terminates (`session` cap); `bad_request` in stdio mode |
 
 ### write
 

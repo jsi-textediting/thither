@@ -224,3 +224,48 @@ H.test("serverio: daemonize reports exec failures and returns the pid", function
   H.eq(got and tonumber(got:match("%d+")), pid)
   U.cleanup()
 end)
+
+H.test("serverio: environ returns environment map", function()
+  local env = serverio.environ()
+  H.eq(type(env), "table")
+  H.ok(env["PATH"] ~= nil, "environ should contain PATH")
+  if os.getenv("HOME") then
+    H.eq(env["HOME"], os.getenv("HOME"))
+  end
+end)
+
+H.test("serverio: shutdown half-closes socket descriptor", function()
+  local dir = U.tmpdir("shutdown")
+  local sock_path = dir .. "/shut.sock"
+  local lfd = serverio.listen(sock_path)
+  H.ok(lfd)
+
+  local cfd = serverio.connect(sock_path)
+  H.ok(cfd)
+  local afd = serverio.accept(lfd)
+  H.ok(afd)
+
+  -- Client writes some data
+  serverio.write("before_shutdown", 0, cfd)
+
+  -- Client half-closes write side
+  local ok = serverio.shutdown(cfd, "w")
+  H.ok(ok)
+
+  -- Server reads data and then reads EOF (nil)
+  local data = serverio.read(1024, afd)
+  H.eq(data, "before_shutdown")
+  local eof = serverio.read(1024, afd)
+  H.eq(eof, nil, "server should read EOF after client shutdown(w)")
+
+  -- Server can still write to client
+  serverio.write("after_shutdown_reply", 0, afd)
+  local reply = serverio.read(1024, cfd)
+  H.eq(reply, "after_shutdown_reply")
+
+  serverio.close(cfd)
+  serverio.close(afd)
+  serverio.close(lfd)
+  U.cleanup()
+end)
+

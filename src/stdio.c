@@ -92,7 +92,15 @@ const char *server_errno_name(int err) {
 /* Closes every descriptor >= lowfd except `keep` (-1: none). Meant for a
 ** child between fork() and exec(): only async-signal-safe calls. */
 void server_close_fds_from(int lowfd, int keep) {
-#if defined(__linux__) && defined(SYS_close_range)
+#if defined(HAVE_CLOSE_RANGE)
+  int ok;
+  if (keep < lowfd)
+    ok = close_range((unsigned) lowfd, ~0U, 0) == 0;
+  else
+    ok = (keep == lowfd || close_range((unsigned) lowfd, (unsigned) keep - 1, 0) == 0)
+      && close_range((unsigned) keep + 1, ~0U, 0) == 0;
+  if (ok) return;
+#elif defined(__linux__) && defined(SYS_close_range)
   int ok;
   if (keep < lowfd)
     ok = syscall(SYS_close_range, (unsigned) lowfd, ~0U, 0) == 0;
@@ -733,6 +741,40 @@ static int f_is_ready(lua_State *L) {
   return 1;
 }
 
+extern char **environ;
+
+static int f_shutdown(lua_State *L) {
+  int fd = (int) luaL_checkinteger(L, 1);
+  const char *how_str = luaL_optstring(L, 2, "w");
+  int how = SHUT_WR;
+  if (strcmp(how_str, "r") == 0) how = SHUT_RD;
+  else if (strcmp(how_str, "rw") == 0) how = SHUT_RDWR;
+  else if (strcmp(how_str, "w") != 0) {
+    return luaL_error(L, "invalid shutdown mode '%s' (expected 'r', 'w', or 'rw')", how_str);
+  }
+  if (shutdown(fd, how) < 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, strerror(errno));
+    lua_pushstring(L, server_errno_name(errno));
+    return 3;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+static int f_environ(lua_State *L) {
+  lua_newtable(L);
+  for (char **e = environ; e && *e; e++) {
+    const char *eq = strchr(*e, '=');
+    if (eq) {
+      lua_pushlstring(L, *e, (size_t) (eq - *e));
+      lua_pushstring(L, eq + 1);
+      lua_rawset(L, -3);
+    }
+  }
+  return 1;
+}
+
 static const luaL_Reg lib[] = {
   { "wait",           f_wait           },
   { "read",           f_read           },
@@ -747,6 +789,8 @@ static const luaL_Reg lib[] = {
   { "accept",         f_accept         },
   { "connect",        f_connect        },
   { "close",          f_close          },
+  { "shutdown",       f_shutdown       },
+  { "environ",        f_environ        },
   { "poll",           f_poll           },
   { "lock",           f_lock           },
   { "unlock",         f_unlock         },

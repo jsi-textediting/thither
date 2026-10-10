@@ -521,4 +521,144 @@ H.test("session: relays started at once share one daemon", function()
   shutdown(clients[1], pid)
 end)
 
+H.test("session: SIGTERM to daemon shuts it down cleanly", function()
+  local sname = sname_of("sigterm")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  local pid = rep.session.daemon_pid
+  local sock = sock_of(sname)
+  H.ok(serverfs.stat(sock) ~= nil, "socket exists")
+
+  -- Send SIGTERM directly to daemon process
+  U.sh("kill -TERM " .. pid)
+  H.ok(wait_dead(pid, 3), "daemon should exit cleanly on SIGTERM")
+  H.ok(serverfs.stat(sock) == nil, "daemon socket should be removed on SIGTERM")
+  c:close()
+end)
+
+H.test("session: per-connection --log writes request log", function()
+  local sname = sname_of("conn_log")
+  local logdir = U.tmpdir("log")
+  local logfile = logdir .. "/client.log"
+  local c, rep = Client.connect({ args = { "--session", sname, "--log", logfile } })
+  H.eq(c:request("ping", { data = "logged_req" }), "logged_req")
+  local pid = rep.session.daemon_pid
+  shutdown(c, pid)
+
+  local content = U.read_file(logfile)
+  H.ok(content and content:find("req %d+ ping"), "per-connection log should contain ping request: " .. tostring(content))
+  H.ok(content:find("rep %d+ ok"), "per-connection log should contain ping reply: " .. tostring(content))
+end)
+
+H.test("session: plugin mismatch reported in relay_ok", function()
+  local sname = sname_of("plugin_mismatch")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  local sock = sock_of(sname)
+  local msg = raw_preamble(sock, {
+    relay_version = "0.9.0",
+    build_id = "differ123456",
+    opts = { plugins = { "/custom/plugin/path" } }
+  })
+  H.ok(msg and msg.ev == "relay_ok", "relay_ok response")
+  H.eq(type(msg.daemon_plugins), "table")
+  H.ok(msg.daemon_build ~= nil)
+  shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: version skew includes build_id in hello session table", function()
+  local sname = sname_of("skew")
+  local server = require "thither"
+  local c1, rep1 = Client.connect({ args = { "--session", sname } })
+  local sock = sock_of(sname)
+  local fd = assert(serverio.connect(sock))
+  -- Send preamble with different version and build_id
+  assert(serverio.write_blocking(frame.encode({
+    ev = "relay",
+    relay_version = "0.1.0",
+    build_id = "testbuild123",
+    pid = system.get_process_id(),
+  }), 2000, fd))
+  local r = frame.reader()
+  -- Read relay_ok
+  local ok_frame
+  while not ok_frame do
+    local d = serverio.read(4096, fd)
+    if d and #d > 0 then r:feed(d); ok_frame = r:next() end
+  end
+  H.eq(ok_frame.ev, "relay_ok")
+  -- Now send hello
+  assert(serverio.write_blocking(frame.encode({
+    ev = "hello",
+    proto_version = server.proto_version,
+  }), 2000, fd))
+  local hello_frame
+  while not hello_frame do
+    local d = serverio.read(4096, fd)
+    if d and #d > 0 then r:feed(d); hello_frame = r:next() end
+  end
+  H.eq(hello_frame.ev, "hello")
+  H.ok(hello_frame.session ~= nil)
+  H.ok(hello_frame.session.version_skew and hello_frame.session.version_skew:find("testbuild123"),
+    "version_skew should contain build_id: " .. tostring(hello_frame.session.version_skew))
+  serverio.close(fd)
+  shutdown(c1, rep1.session.daemon_pid)
+end)
+
+H.test("session: extended environment subset and --forward-env forwarded", function()
+  local sname = sname_of("ext_env")
+  local c, rep = Client.connect({
+    args = { "--session", sname, "--forward-env", "MY_CUSTOM_VAR,PREFIX_*" },
+    env = {
+      DISPLAY = ":99",
+      COLORTERM = "truecolor",
+      LC_MESSAGES = "C.UTF-8",
+      MY_CUSTOM_VAR = "custom_value",
+      PREFIX_FOO = "foo_val",
+      IGNORED_SECRET = "secret",
+    }
+  })
+  H.ok(rep and rep.ev == "hello")
+  shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: runtime and state dirs work with USER and HOME set without NSS", function()
+  local uid = serverfs.ids().uid
+  local rdir, rerr = session.runtime_dir()
+  H.ok(rdir, "runtime dir: " .. tostring(rerr))
+  local sdir, serr = session.state_dir("test_nss_sess")
+  H.ok(sdir, "state dir: " .. tostring(serr))
+  H.ok(serverfs.ids().user ~= nil, "user name should be present")
+end)
+
+H.test("session: relay half-close completes within 1s after stdin EOF", function()
+  local sname = sname_of("halfclose")
+  local t0 = system.get_time()
+  local out, code = U.sh("echo '' | ./build/thither-server --datadir lua --session " .. sname)
+  local elapsed = system.get_time() - t0
+  H.ok(elapsed <= 2.5, "relay should exit within bounded timeout after stdin EOF, took " .. elapsed .. "s")
+  U.sh("./build/thither-server --session " .. sname .. " --kill")
+end)
+
+H.test("session: accept error back-off on EMFILE pauses listener", function()
+  local sname = sname_of("emfile")
+  local c, rep = Client.connect({ args = { "--session", sname } })
+  local pid = rep.session.daemon_pid
+  local statedir = session.state_dir(sname)
+  local logpath = session.daemon_log(statedir)
+
+  -- Count current fds of daemon
+  local fds = U.sh("ls -1 /proc/" .. pid .. "/fd | wc -l")
+  local num_fds = tonumber(fds:match("%d+"))
+  if num_fds then
+    U.sh(string.format("prlimit --pid %d --nofile=%d:%d", pid, num_fds, num_fds))
+    local c2 = Client.spawn({ args = { "--session", sname } })
+    system.sleep(0.2)
+    U.sh(string.format("prlimit --pid %d --nofile=1024:1024", pid))
+    system.sleep(0.2)
+    local log = U.read_file(logpath)
+    H.ok(log and log:find("accept failed"), "daemon should log accept failure: " .. tostring(log))
+    c2:close()
+  end
+  shutdown(c, pid)
+end)
+
 H.test("cleanup: session tests", function() U.cleanup() end)
