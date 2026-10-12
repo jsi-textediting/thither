@@ -137,6 +137,8 @@ static void usage(FILE *f) {
     "  --kill              Shut down the named session daemon\n"
     "  --idle-exit <sec>   Idle timeout before daemon exits (default 600)\n"
     "  --retain-exited <sec> Time to retain exited process buffers (default 3600)\n"
+    "  --systemd-scope     Start the session daemon in a systemd user scope\n"
+    "                      (systemd-run --user --scope) when systemd-run is on PATH\n"
     "  --root <dir>        Restrict non-exec file operations to <dir>\n"
     "  --log <file>        Append a request log to <file>\n"
     "  --forward-env <vars> Extra environment variables/patterns to forward\n"
@@ -156,7 +158,7 @@ int main(int argc, char **argv) {
 
   const char *datadir_opt = NULL, *root = NULL, *logfile = NULL, *run_script = NULL;
   const char *session = NULL, *forward_env = NULL;
-  int is_daemon = 0, is_kill = 0, idle_exit = 600, retain_exited = 3600;
+  int is_daemon = 0, is_kill = 0, systemd_scope = 0, idle_exit = 600, retain_exited = 3600;
   const char *plugins[64];
   int nplugins = 0, run_first_arg = 0;
 
@@ -188,6 +190,8 @@ int main(int argc, char **argv) {
       is_daemon = 1;
     } else if (!strcmp(a, "--kill")) {
       is_kill = 1;
+    } else if (!strcmp(a, "--systemd-scope")) {
+      systemd_scope = 1;
     } else if (!strcmp(a, "--idle-exit") && i + 1 < argc) {
       idle_exit = atoi(argv[++i]);
     } else if (!strcmp(a, "--retain-exited") && i + 1 < argc) {
@@ -282,6 +286,10 @@ int main(int argc, char **argv) {
   if (is_kill) {
     lua_pushboolean(L, 1);
     lua_setfield(L, -2, "kill");
+  }
+  if (systemd_scope) {
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "systemd_scope");
   }
   lua_pushinteger(L, idle_exit);
   lua_setfield(L, -2, "idle_exit");

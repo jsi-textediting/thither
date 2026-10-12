@@ -6,9 +6,44 @@ local serverio = require "serverio"
 local serverfs = require "serverfs"
 local session = require "thither.session"
 
+-- Every session of this suite lives under one temporary base (made on first
+-- use, removed by the cleanup test), never in the real XDG directories. The
+-- relays and daemons get XDG_RUNTIME_DIR / XDG_STATE_HOME pointing there; Lua
+-- has no setenv, so in-process session.runtime_dir() / state_dir() would
+-- still name the real directories: the paths are computed from the base.
+local base_dir
+local function base()
+  if not base_dir then base_dir = U.tmpdir("sessions") end
+  return base_dir
+end
+local function xdg_env()
+  return { XDG_RUNTIME_DIR = base() .. "/run", XDG_STATE_HOME = base() .. "/state" }
+end
+--- The runtime directory (created 0700 like the relay does).
+local function rundir()
+  local d = base() .. "/run/thither-server"
+  assert(session.verify_dir(d))
+  return d
+end
+local function statedir_of(sname) return base() .. "/state/thither-server/" .. sname end
+local function sock_of(sname) return assert(session.socket_path(rundir(), sname)) end
+--- Shell prefix that runs a command with the suite's XDG directories.
+local function xdg_sh()
+  local e = xdg_env()
+  return "XDG_RUNTIME_DIR=" .. U.shq(e.XDG_RUNTIME_DIR) .. " XDG_STATE_HOME=" .. U.shq(e.XDG_STATE_HOME) .. " "
+end
+local function with_xdg(opts)
+  local o = {}
+  for k, v in pairs(opts or {}) do o[k] = v end
+  o.env_extra = xdg_env()
+  return o
+end
+local function connect(opts) return Client.connect(with_xdg(opts)) end
+local function spawn(opts) return Client.spawn(with_xdg(opts)) end
+
 H.test("session: relay spawns daemon and completes handshake", function()
   local sname = "sess_spawn_" .. tostring(system.get_process_id())
-  local c, reply = Client.connect({ args = { "--session", sname } })
+  local c, reply = connect({ args = { "--session", sname } })
 
   H.eq(reply.ev, "hello")
   H.ok(reply.session ~= nil, "hello reply should include session table")
@@ -35,8 +70,7 @@ H.test("session: relay spawns daemon and completes handshake", function()
   H.eq(sinfo.connections, 1)
 
   -- Socket file exists
-  local rundir = assert(session.runtime_dir())
-  local sock_path = assert(session.socket_path(rundir, sname))
+  local sock_path = sock_of(sname)
   H.ok(serverfs.stat(sock_path) ~= nil, "daemon socket file should exist")
 
   -- Shutdown daemon cleanly
@@ -54,10 +88,13 @@ H.test("session: relay spawns daemon and completes handshake", function()
   end
   H.ok(dead, "daemon process should exit after session_shutdown")
   H.ok(serverfs.stat(sock_path) == nil, "daemon socket should be removed after shutdown")
+  -- kept on purpose: the 0-byte lock (the next start reuses it) and the log
+  H.ok(U.exists(session.lock_path(rundir(), sname)), "the lock file is kept")
+  H.ok(U.exists(session.daemon_log(statedir_of(sname))), "the daemon log is kept")
 end)
 
 H.test("session: session ops outside daemon mode are refused with bad_request", function()
-  local c = Client.connect() -- stdio mode
+  local c = connect() -- stdio mode
 
   local res, err = c:request("session_info")
   H.eq(res, nil)
@@ -72,8 +109,8 @@ end)
 
 H.test("session: multiple concurrent relays attach to same daemon", function()
   local sname = "sess_multi_" .. tostring(system.get_process_id())
-  local c1, rep1 = Client.connect({ args = { "--session", sname } })
-  local c2, rep2 = Client.connect({ args = { "--session", sname } })
+  local c1, rep1 = connect({ args = { "--session", sname } })
+  local c2, rep2 = connect({ args = { "--session", sname } })
 
   H.eq(rep1.session.daemon_pid, rep2.session.daemon_pid, "both relays must attach to the same daemon")
 
@@ -94,7 +131,7 @@ end)
 
 H.test("session: killing relay leaves daemon running, and second relay can reattach", function()
   local sname = "sess_reattach_" .. tostring(system.get_process_id())
-  local c1, rep1 = Client.connect({ args = { "--session", sname } })
+  local c1, rep1 = connect({ args = { "--session", sname } })
   local daemon_pid = rep1.session.daemon_pid
 
   -- Kill the relay process immediately
@@ -107,7 +144,7 @@ H.test("session: killing relay leaves daemon running, and second relay can reatt
   H.eq(kcode, 0, "daemon process should still be running after relay killed")
 
   -- Reconnect with fresh relay
-  local c2, rep2 = Client.connect({ args = { "--session", sname } })
+  local c2, rep2 = connect({ args = { "--session", sname } })
   H.eq(rep2.session.daemon_pid, daemon_pid, "second relay should connect to existing daemon")
   H.eq(c2:request("ping"), true)
 
@@ -125,12 +162,12 @@ H.test("session: dynamic SSH_AUTH_SOCK agent.sock symlink", function()
   local lfd2 = assert(serverio.listen(sock2))
   U.write_file(notsock, "not a socket")
 
-  local c1, rep1 = Client.connect({
+  local c1, rep1 = connect({
     args = { "--session", sname },
     env = { SSH_AUTH_SOCK = sock1 },
   })
 
-  local statedir = assert(session.state_dir(sname))
+  local statedir = statedir_of(sname)
   local agent_link = session.agent_link(statedir)
 
   local st = serverfs.stat(agent_link, true)
@@ -138,7 +175,7 @@ H.test("session: dynamic SSH_AUTH_SOCK agent.sock symlink", function()
   H.eq(st.link, sock1)
 
   -- Connect second relay with different SSH_AUTH_SOCK
-  local c2, rep2 = Client.connect({
+  local c2, rep2 = connect({
     args = { "--session", sname },
     env = { SSH_AUTH_SOCK = sock2 },
   })
@@ -155,7 +192,7 @@ H.test("session: dynamic SSH_AUTH_SOCK agent.sock symlink", function()
   H.eq(st.link, sock1, "agent.sock should revert to remaining c1 agent socket")
 
   -- a relay whose SSH_AUTH_SOCK is not a socket does not move the link
-  local c3 = Client.connect({
+  local c3 = connect({
     args = { "--session", sname },
     env = { SSH_AUTH_SOCK = notsock },
   })
@@ -175,11 +212,11 @@ end)
 
 H.test("session: CLI --kill terminates daemon", function()
   local sname = "sess_kill_" .. tostring(system.get_process_id())
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   local daemon_pid = rep.session.daemon_pid
 
   local datadir_arg = DATADIR and (" --datadir " .. U.shq(DATADIR)) or ""
-  local out, code = U.sh(U.shq(EXEFILE) .. datadir_arg .. " --session " .. sname .. " --kill")
+  local out, code = U.sh(xdg_sh() .. U.shq(EXEFILE) .. datadir_arg .. " --session " .. sname .. " --kill")
   H.eq(code, 0, "CLI --kill should exit 0")
 
   local deadline = system.get_time() + 3
@@ -212,12 +249,12 @@ H.test("session: idle exit timer", function()
   local sname = "sess_idle_" .. tostring(system.get_process_id())
   local agent = "/tmp/thither_idle_agent_" .. tostring(system.get_process_id()) .. ".sock"
   local afd = assert(serverio.listen(agent))
-  os.remove(session.daemon_log(assert(session.state_dir(sname))))
-  local c, rep = Client.connect({ args = { "--session", sname, "--idle-exit", "1" },
+  os.remove(session.daemon_log(statedir_of(sname)))
+  local c, rep = connect({ args = { "--session", sname, "--idle-exit", "1" },
                                   env = { SSH_AUTH_SOCK = agent } })
   local daemon_pid = rep.session.daemon_pid
-  local statedir = assert(session.state_dir(sname))
-  local sock_path = assert(session.socket_path(assert(session.runtime_dir()), sname))
+  local statedir = statedir_of(sname)
+  local sock_path = sock_of(sname)
   H.ok(serverfs.stat(session.agent_link(statedir), true), "agent link while attached")
 
   H.eq(c:request("ping"), true)
@@ -251,10 +288,6 @@ end)
 local frame = require "thither.frame"
 
 local function sname_of(tag) return "s_" .. tag .. "_" .. tostring(system.get_process_id()) end
-
-local function sock_of(sname)
-  return assert(session.socket_path(assert(session.runtime_dir()), sname))
-end
 
 local function alive(pid)
   local _, k = U.sh("kill -0 " .. pid)
@@ -315,7 +348,7 @@ H.test("session: a bad relay preamble is refused, the daemon survives", function
     .. " && ln -s " .. U.shq(dir .. "/outside") .. " " .. U.shq(root .. "/escape")
     .. " && echo x > " .. U.shq(root .. "/file"))
   local sname = sname_of("badpre")
-  local c, rep = Client.connect({ args = { "--session", sname, "--root", root } })
+  local c, rep = connect({ args = { "--session", sname, "--root", root } })
   local pid = rep.session.daemon_pid
   local sock = sock_of(sname)
   for _, case in ipairs({
@@ -345,13 +378,13 @@ H.test("session: a bad relay preamble is refused, the daemon survives", function
   local m = raw_preamble(sock, { opts = { root = root .. "/escape" } })
   H.ok(m and m.ev == "relay_ok" and not m.err, "a root outside the first relay's: " .. tostring(m and m.err and m.err.code))
   -- through a real relay: the client gets an error hello, the relay exits 2
-  local bad = Client.spawn({ args = { "--session", sname, "--root", root .. "/nope" } })
+  local bad = spawn({ args = { "--session", sname, "--root", root .. "/nope" } })
   local hello = bad:hello()
   H.ok(hello and hello.ev == "hello" and hello.err, "error hello from a refused relay")
   H.eq(hello and hello.err and hello.err.code, "ENOENT")
   H.eq(bad:wait_exit(5), 2)
   -- a good relay still works, on the same daemon
-  local c2, rep2 = Client.connect({ args = { "--session", sname, "--root", root .. "/sub" } })
+  local c2, rep2 = connect({ args = { "--session", sname, "--root", root .. "/sub" } })
   H.eq(rep2.session.daemon_pid, pid)
   H.eq(c2:request("ping", { data = "ok" }), "ok")
   H.eq(c2:request("info").root, serverfs.realpath(root .. "/sub"))
@@ -398,8 +431,8 @@ end
 H.test("session: set_root records a per-connection project root and does not jail", function()
   local dir, spelled, real = symlinked_tree("sroot")
   local sname = sname_of("setroot")
-  local c, rep = Client.connect({ args = { "--session", sname } })
-  local c2 = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
+  local c2 = connect({ args = { "--session", sname } })
   H.ok(c:request("set_root", { path = spelled }))
   local info = c:request("info")
   H.eq(info.project_root, real, "the project root is stored as its realpath")
@@ -417,7 +450,7 @@ end)
 H.test("session: --root through a symlink (per-connection preamble root)", function()
   local dir, spelled, real = symlinked_tree("proot")
   local sname = sname_of("symroot")
-  local c, rep = Client.connect({ args = { "--session", sname, "--root", spelled } })
+  local c, rep = connect({ args = { "--session", sname, "--root", spelled } })
   H.eq(rep.root, real)
   check_symlinked_root(c, dir, spelled, real)
   -- the root in its symlinked spelling can be stat'ed without following
@@ -441,15 +474,15 @@ H.test("session: --root and --log are per connection, not inherited from the fir
   U.write_file(dir .. "/b/fb.txt", "bb")
   local ra, rb = serverfs.realpath(dir .. "/a"), serverfs.realpath(dir .. "/b")
   local sname = sname_of("multiroot")
-  local statedir = assert(session.state_dir(sname))
+  local statedir = statedir_of(sname)
   os.remove(session.daemon_log(statedir))
   local loga = dir .. "/a.log"
   -- the first relay starts the daemon
-  local c1, rep1 = Client.connect({ args = { "--session", sname, "--root", ra, "--log", loga } })
+  local c1, rep1 = connect({ args = { "--session", sname, "--root", ra, "--log", loga } })
   local pid = rep1.session.daemon_pid
   H.eq(rep1.root, ra)
   -- a second relay with another root, outside the first one's
-  local c2, rep2 = Client.connect({ args = { "--session", sname, "--root", rb } })
+  local c2, rep2 = connect({ args = { "--session", sname, "--root", rb } })
   H.eq(rep2.session.daemon_pid, pid, "same daemon")
   H.eq(rep2.root, rb)
   H.eq(c2:request("stat", { path = rb .. "/fb.txt" }).size, 2)
@@ -458,7 +491,7 @@ H.test("session: --root and --log are per connection, not inherited from the fir
   _, err = c1:request("stat", { path = rb .. "/fb.txt" })
   H.eq(err and err.code, "jail", "the first relay keeps its root")
   -- a third relay without --root is not jailed at all
-  local c3, rep3 = Client.connect({ args = { "--session", sname } })
+  local c3, rep3 = connect({ args = { "--session", sname } })
   H.eq(rep3.session.daemon_pid, pid, "same daemon")
   H.eq(rep3.root, nil, "no jail inherited from the first relay")
   H.eq(c3:request("info").root, nil)
@@ -480,7 +513,7 @@ end)
 
 H.test("session: an attached idle relay does not spin", function()
   local sname = sname_of("relaycpu")
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   local rpid = c.proc:pid()
   if not ticks_of(rpid) then shutdown(c) print("     (skipped: no /proc)") return end
   H.eq(c:request("ping"), true)
@@ -499,8 +532,8 @@ H.test("session: relay stdin EOF still delivers large and async replies in fligh
   local MB = 1024 * 1024
   U.sh("yes 'a line for the relay stdin eof test' | head -c " .. (8 * MB) .. " > " .. U.shq(path))
   local sname = sname_of("relayeof2")
-  local c0, rep = Client.connect({ args = { "--session", sname } })
-  local c = Client.spawn({ args = { "--session", sname } })
+  local c0, rep = connect({ args = { "--session", sname } })
+  local c = spawn({ args = { "--session", sname } })
   c:send({ ev = "hello", proto_version = 1, client_version = "tests", caps = {} })
   -- a reply far larger than the socket buffer, and a job that yields
   c:send({ id = 1, op = "read", args = { path = path, offset = 0, len = 4 * MB } })
@@ -521,8 +554,8 @@ end)
 
 H.test("session: relay stdin EOF still delivers the replies in flight", function()
   local sname = sname_of("relayeof")
-  local c0, rep = Client.connect({ args = { "--session", sname } })
-  local c = Client.spawn({ args = { "--session", sname } })
+  local c0, rep = connect({ args = { "--session", sname } })
+  local c = spawn({ args = { "--session", sname } })
   c:send({ ev = "hello", proto_version = 1, client_version = "tests", caps = {} })
   c:send({ id = 1, op = "ping", args = { data = "late" } })
   c.proc:close_stream(process.STREAM_STDIN)
@@ -535,7 +568,7 @@ end)
 
 H.test("session: --kill gives up on a daemon that does not answer", function()
   local datadir_arg = DATADIR and (" --datadir " .. U.shq(DATADIR)) or ""
-  local kill = U.shq(EXEFILE) .. datadir_arg .. " --session "
+  local kill = xdg_sh() .. U.shq(EXEFILE) .. datadir_arg .. " --session "
   -- absent
   local t0 = system.get_time()
   local _, code = U.sh(kill .. sname_of("killnone") .. " --kill")
@@ -576,12 +609,12 @@ H.test("session: a stale socket is recovered, a non-socket is refused", function
   -- a socket file nobody listens on any more
   serverio.close(assert(serverio.listen(sock)))
   H.ok(serverfs.stat(sock, true), "stale socket file in place")
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   H.eq(c:request("ping", { data = "fresh" }), "fresh")
   shutdown(c, rep.session.daemon_pid)
   -- a regular file in place of the socket is never connected to nor removed
   U.write_file(sock, "not a socket")
-  local bad = Client.spawn({ args = { "--session", sname } })
+  local bad = spawn({ args = { "--session", sname } })
   H.eq(bad:wait_exit(5), 1, "relay refuses a non-socket")
   H.ok(bad.stderr:find("not a socket", 1, true), "stderr: " .. bad.stderr)
   H.eq(U.read_file(sock), "not a socket", "file untouched")
@@ -591,7 +624,7 @@ end)
 H.test("session: relays started at once share one daemon", function()
   local sname = sname_of("race")
   local clients = {}
-  for i = 1, 6 do clients[i] = Client.spawn({ args = { "--session", sname } }) end
+  for i = 1, 6 do clients[i] = spawn({ args = { "--session", sname } }) end
   local pid
   for i, c in ipairs(clients) do
     local hello = c:hello()
@@ -614,7 +647,7 @@ end)
 
 H.test("session: SIGTERM to daemon shuts it down cleanly", function()
   local sname = sname_of("sigterm")
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   local pid = rep.session.daemon_pid
   local sock = sock_of(sname)
   H.ok(serverfs.stat(sock) ~= nil, "socket exists")
@@ -630,7 +663,7 @@ H.test("session: per-connection --log writes request log", function()
   local sname = sname_of("conn_log")
   local logdir = U.tmpdir("log")
   local logfile = logdir .. "/client.log"
-  local c, rep = Client.connect({ args = { "--session", sname, "--log", logfile } })
+  local c, rep = connect({ args = { "--session", sname, "--log", logfile } })
   H.eq(c:request("ping", { data = "logged_req" }), "logged_req")
   local pid = rep.session.daemon_pid
   shutdown(c, pid)
@@ -644,7 +677,7 @@ end)
 
 H.test("session: plugin mismatch reported in relay_ok", function()
   local sname = sname_of("plugin_mismatch")
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   local sock = sock_of(sname)
   local msg = raw_preamble(sock, {
     relay_version = "0.9.0",
@@ -655,11 +688,11 @@ H.test("session: plugin mismatch reported in relay_ok", function()
   H.eq(type(msg.daemon_plugins), "table")
   H.ok(msg.daemon_build ~= nil)
   -- the daemon logs the mismatch
-  local dlog = U.read_file(session.daemon_log(assert(session.state_dir(sname)))) or ""
+  local dlog = U.read_file(session.daemon_log(statedir_of(sname))) or ""
   H.ok(dlog:find("differ from daemon plugins", 1, true), "mismatch in the daemon log:\n" .. dlog)
   -- and a real relay asking for other plugins warns on its stderr
   local plugdir = U.tmpdir("noplug")
-  local c2 = Client.connect({ args = { "--session", sname, "--plugins", plugdir } })
+  local c2 = connect({ args = { "--session", sname, "--plugins", plugdir } })
   H.eq(c2:request("ping", { data = 1 }), 1)
   c2:pump()
   H.ok(c2.stderr:find("session plugins differ", 1, true), "relay warning: " .. c2.stderr)
@@ -670,7 +703,7 @@ end)
 H.test("session: version skew includes build_id in hello session table", function()
   local sname = sname_of("skew")
   local server = require "thither"
-  local c1, rep1 = Client.connect({ args = { "--session", sname } })
+  local c1, rep1 = connect({ args = { "--session", sname } })
   local sock = sock_of(sname)
   local fd = assert(serverio.connect(sock))
   -- Send preamble with different version and build_id
@@ -727,12 +760,12 @@ server.register("envdump", { env = function(_, req) return req.conn and req.conn
     MY_CUSTOM_VAR2 = "not forwarded",
     IGNORED_SECRET = "secret",
   }
-  -- what the relay and the daemon need to find their directories
-  for _, k in ipairs({ "PATH", "HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME" }) do
+  -- what the relay and the daemon need (the XDG pair comes from with_xdg)
+  for _, k in ipairs({ "PATH", "HOME", "USER", "LOGNAME" }) do
     env[k] = os.getenv(k)
   end
   local sname = sname_of("ext_env")
-  local c, rep = Client.connect({
+  local c, rep = connect({
     args = { "--session", sname, "--plugins", plugdir, "--forward-env", "MY_CUSTOM_VAR, PREFIX_*" },
     env = env,
   })
@@ -751,7 +784,7 @@ end)
 H.test("session: runtime and state dirs come from XDG_RUNTIME_DIR / XDG_STATE_HOME without HOME or USER", function()
   local base = U.tmpdir("xdgdirs")
   local sname = sname_of("xdg")
-  local c, rep = Client.connect({ args = { "--session", sname }, env = {
+  local c, rep = connect({ args = { "--session", sname }, env = {
     PATH = os.getenv("PATH") or "/usr/bin:/bin",
     XDG_RUNTIME_DIR = base .. "/run",
     XDG_STATE_HOME = base .. "/state",
@@ -766,8 +799,8 @@ end)
 
 H.test("session: relay half-close completes within 1s after stdin EOF", function()
   local sname = sname_of("halfclose")
-  local c0, rep = Client.connect({ args = { "--session", sname } })
-  local c = Client.spawn({ args = { "--session", sname } })
+  local c0, rep = connect({ args = { "--session", sname } })
+  local c = spawn({ args = { "--session", sname } })
   local hello = c:hello()
   H.ok(hello and hello.ev == "hello" and not hello.err, "hello")
   local t0 = system.get_time()
@@ -782,9 +815,9 @@ end)
 
 H.test("session: accept error back-off on EMFILE pauses listener", function()
   local sname = sname_of("emfile")
-  local c, rep = Client.connect({ args = { "--session", sname } })
+  local c, rep = connect({ args = { "--session", sname } })
   local pid = rep.session.daemon_pid
-  local statedir = session.state_dir(sname)
+  local statedir = statedir_of(sname)
   local logpath = session.daemon_log(statedir)
 
   -- Count current fds of daemon
@@ -800,9 +833,13 @@ H.test("session: accept error back-off on EMFILE pauses listener", function()
   -- lower only the soft limit: raising a hard limit back needs privileges
   local _, lcode = U.sh(string.format("prlimit --pid %d --nofile=%d:", pid, num_fds))
   H.eq(lcode, 0, "prlimit lowering the soft limit")
-  local c2 = Client.spawn({ args = { "--session", sname } })
-  system.sleep(0.3)
-  local log = U.read_file(logpath)
+  local c2 = spawn({ args = { "--session", sname } })
+  local log
+  local deadline = system.get_time() + 3
+  repeat
+    system.sleep(0.05)
+    log = U.read_file(logpath)
+  until (log and log:find("accept failed")) or system.get_time() > deadline
   H.ok(log and log:find("accept failed"), "daemon should log accept failure: " .. tostring(log))
   H.eq(c:request("ping", { data = "busy" }, 5), "busy", "the open connection is still served")
   local _, rcode = U.sh(string.format("prlimit --pid %d --nofile=%s:", pid, orig))
@@ -812,6 +849,64 @@ H.test("session: accept error back-off on EMFILE pauses listener", function()
   H.ok(hello and hello.ev == "hello" and not hello.err, "the waiting relay is served after the back-off: " .. c2.stderr)
   c2:close()
   shutdown(c, pid)
+end)
+
+H.test("session: a slow reply after stdin EOF still gets through the relay", function()
+  -- a plugin op that answers after ~2 s without blocking the daemon's loop
+  local plugdir = U.tmpdir("slowplug")
+  U.write_file(plugdir .. "/slow.lua", [[
+local server = require "thither"
+server.register("slow", { reply = function(args, req) req:sleep(args.ms or 2000) return "late" end })
+]])
+  local sname = sname_of("slowreply")
+  local c0, rep = connect({ args = { "--session", sname, "--plugins", plugdir } })
+  local c = spawn({ args = { "--session", sname, "--plugins", plugdir } })
+  local hello = c:hello()
+  H.ok(hello and hello.ev == "hello" and not hello.err, "hello")
+  c:send({ id = 7, op = "call", args = { service = "slow", method = "reply", args = { ms = 2000 } } })
+  -- the daemon is free meanwhile
+  H.eq(c0:request("ping", { data = "free" }), "free")
+  local t0 = system.get_time()
+  c.proc:close_stream(process.STREAM_STDIN)
+  H.eq(c:wait_exit(session.EOF_DRAIN_MS / 1000 + 3), 0, "relay exit status")
+  local took = system.get_time() - t0
+  local m = c:recv(1)
+  H.ok(m and m.id == 7 and m.ok == "late",
+    "the slow reply arrives after stdin EOF: " .. tostring(m and (m.err and m.err.code or m.ok)) .. "\n" .. c.stderr)
+  H.ok(took >= 1 and took < session.EOF_DRAIN_MS / 1000,
+    string.format("the relay exits once the daemon closes, took %.2f s", took))
+  shutdown(c0, rep.session.daemon_pid)
+end)
+
+H.test("session: --systemd-scope starts the daemon through systemd-run when it is on PATH", function()
+  local o = { session = "x", idle_exit = 5, plugins = { "/p" } }
+  local argv, warn = session.daemon_argv(o, "/exe", "/data", "/nonexistent")
+  H.eq(argv, { "/exe", "--daemon", "--session", "x", "--idle-exit", "5", "--retain-exited", "3600",
+               "--datadir", "/data", "--plugins", "/p" }, "no scope by default")
+  H.eq(warn, nil)
+  o.systemd_scope = true
+  argv, warn = session.daemon_argv(o, "/exe", nil, "/nonexistent")
+  H.eq(argv[1], "/exe", "no systemd-run: started as before")
+  H.ok(warn and warn:find("systemd-run", 1, true), "and a warning: " .. tostring(warn))
+  -- a fake systemd-run that records its arguments and runs the command
+  local bin = U.tmpdir("fakesd")
+  local rec = bin .. "/args"
+  U.write_file(bin .. "/systemd-run", "#!/bin/sh\nprintf '%s\\n' \"$@\" > " .. U.shq(rec) .. "\n[ \"$1 $2 $3 $4\" = '--user --scope --quiet --' ] || exit 99\nshift 4\nexec \"$@\"\n")
+  U.sh("chmod 755 " .. U.shq(bin .. "/systemd-run"))
+  argv, warn = session.daemon_argv(o, "/exe", nil, "/nonexistent:" .. bin)
+  H.eq(warn, nil)
+  H.eq({ argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7] },
+       { bin .. "/systemd-run", "--user", "--scope", "--quiet", "--", "/exe", "--daemon" })
+  -- end to end: the relay finds it on its PATH and the daemon runs under it
+  local sname = sname_of("sdscope")
+  local c, rep = connect({ args = { "--session", sname, "--systemd-scope" },
+                           env = { PATH = bin .. ":" .. (os.getenv("PATH") or "/usr/bin:/bin") } })
+  H.eq(c:request("ping", { data = "scoped" }), "scoped")
+  local got = U.read_file(rec) or ""
+  H.ok(got:find("--user\n--scope\n--quiet\n--\n" .. EXEFILE .. "\n--daemon\n", 1, true),
+    "systemd-run argv:\n" .. got)
+  H.ok(alive(rep.session.daemon_pid), "the daemon runs")
+  shutdown(c, rep.session.daemon_pid)
 end)
 
 H.test("cleanup: session tests", function() U.cleanup() end)

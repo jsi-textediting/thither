@@ -3,6 +3,11 @@ local serverfs = require "serverfs"
 
 local session = {}
 
+-- after EOF on a daemon connection (a relay half-closes after its stdin EOF):
+-- how long its requests in flight may still run and their replies drain. The
+-- relay waits this long (plus a margin) for the daemon to close.
+session.EOF_DRAIN_MS = 5000
+
 function session.validate_name(name)
   name = name or "default"
   if type(name) ~= "string" or not name:match("^[%w._%-]+$") or #name < 1 or #name > 32 then
@@ -114,6 +119,54 @@ end
 
 function session.daemon_log(statedir)
   return statedir .. "/daemon.log"
+end
+
+--- First executable `name` in the colon-separated `path` (default $PATH),
+--- or nil.
+function session.find_in_path(name, path)
+  path = path or os.getenv("PATH") or ""
+  for dir in path:gmatch("[^:]+") do
+    local f = dir .. "/" .. name
+    local st = serverfs.stat(f)
+    if st and st.type == "file" and serverfs.access(f, 1) then return f end
+  end
+  return nil
+end
+
+--- The argv a relay starts the daemon with: argv, warning | nil.
+--- o: session (validated name), idle_exit, retain_exited, plugins,
+--- systemd_scope; exefile and datadir as EXEFILE / DATADIR; path for the
+--- systemd-run lookup (default $PATH). With systemd_scope and systemd-run on
+--- the path the daemon runs in a transient user scope, so that logind's
+--- KillUserProcesses does not end it with the login session.
+function session.daemon_argv(o, exefile, datadir, path)
+  local argv, warning = {}, nil
+  if o.systemd_scope then
+    local sr = session.find_in_path("systemd-run", path)
+    if sr then
+      for _, a in ipairs({ sr, "--user", "--scope", "--quiet", "--" }) do argv[#argv + 1] = a end
+    else
+      warning = "--systemd-scope: systemd-run is not on PATH, starting the daemon without a scope"
+    end
+  end
+  for _, a in ipairs({
+    exefile,
+    "--daemon",
+    "--session", o.session,
+    "--idle-exit", tostring(o.idle_exit or 600),
+    "--retain-exited", tostring(o.retain_exited or 3600),
+  }) do argv[#argv + 1] = a end
+  if datadir then
+    argv[#argv + 1] = "--datadir"
+    argv[#argv + 1] = datadir
+  end
+  -- --root and --log are per connection: they go in the preamble only.
+  -- The daemon has no jail of its own and logs to <state>/daemon.log.
+  for _, p in ipairs(o.plugins or {}) do
+    argv[#argv + 1] = "--plugins"
+    argv[#argv + 1] = p
+  end
+  return argv, warning
 end
 
 return session

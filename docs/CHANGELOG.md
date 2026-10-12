@@ -12,6 +12,28 @@ The wire protocol is versioned by a single integer (`proto_version`, still
 
 ## Unreleased
 
+### Session leftovers (2026-10-12)
+
+* The relay keeps forwarding the daemon's output after stdin EOF until the
+  daemon closes the connection (it does as soon as nothing is in flight), for
+  up to the daemon's 5 s drain (`session.EOF_DRAIN_MS`) plus 1 s. It used to
+  stop after 1 s, so a slower reply was lost.
+* New relay flag `--systemd-scope` (off by default): the daemon is started
+  through `systemd-run --user --scope --quiet --` when `systemd-run` is on
+  `PATH`, outside the login session that logind's `KillUserProcesses=yes`
+  kills; without it the relay warns and starts the daemon as before.
+* The 0-byte `<name>.lock` and `<state>/<name>/daemon.log` (and `.1`) are
+  kept after any daemon exit, on purpose; the next start reuses the lock.
+  Documented, no behaviour change.
+* Docs: the `session_closing` event (sent on every daemon exit, including
+  SIGTERM and the idle exit), `session_info.procs` / `rings_bytes` (0 for
+  now), the 0-60000 clamp of `session_shutdown.timeout_ms`, and a Sessions
+  section in the README (files, `--kill`, `--idle-exit`, the
+  `loginctl enable-linger` workaround).
+* Tests: `test_session` runs every session under a temporary
+  `XDG_RUNTIME_DIR` / `XDG_STATE_HOME` and no longer leaves `s_*` / `sess_*`
+  directories in the real ones; the test client takes `env_extra`.
+
 ### Server C fixes (2026-10-12)
 
 * The session daemon ignores `SIGHUP`, as documented; only `SIGTERM`/`SIGINT`

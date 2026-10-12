@@ -10,7 +10,9 @@ Client.__index = Client
 local function now() return system.get_time() end
 
 --- opts: args (extra server arguments), datadir (false: none, use the
---- embedded modules), server (executable)
+--- embedded modules), server (executable), env (the whole environment),
+--- env_extra (variables added to opts.env, or to the inherited environment
+--- without it; a key opts.env sets itself wins)
 function Client.spawn(opts)
   opts = opts or {}
   local cmd = { opts.server or EXEFILE, "--stdio" }
@@ -21,9 +23,17 @@ function Client.spawn(opts)
   end
   for _, a in ipairs(opts.args or {}) do cmd[#cmd + 1] = a end
   local env
-  if opts.env then
+  local vars = opts.env
+  if opts.env_extra then
+    vars = {}
+    for k, v in pairs(opts.env or require("serverio").environ()) do vars[k] = v end
+    for k, v in pairs(opts.env_extra) do
+      if not (opts.env and opts.env[k] ~= nil) then vars[k] = v end
+    end
+  end
+  if vars then
     local parts = {}
-    for k, v in pairs(opts.env) do parts[#parts + 1] = k .. "=" .. v .. "\0" end
+    for k, v in pairs(vars) do parts[#parts + 1] = k .. "=" .. v .. "\0" end
     local blob = table.concat(parts)
     env = function() return blob end
   end

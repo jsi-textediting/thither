@@ -132,25 +132,14 @@ if not sock_fd then
         return 1
       end
       if why == "socket" then os.remove(sock_path) end
-      local daemon_args = {
-        EXEFILE,
-        "--daemon",
-        "--session", sname,
-        "--idle-exit", tostring(opts.idle_exit or 600),
-        "--retain-exited", tostring(opts.retain_exited or 3600),
-      }
-      if DATADIR then
-        table.insert(daemon_args, "--datadir")
-        table.insert(daemon_args, DATADIR)
-      end
-      -- --root and --log are per connection: they go in the preamble only.
-      -- The daemon has no jail of its own and logs to <state>/daemon.log.
-      if opts.plugins then
-        for _, p in ipairs(opts.plugins) do
-          table.insert(daemon_args, "--plugins")
-          table.insert(daemon_args, p)
-        end
-      end
+      local daemon_args, dwarn = session.daemon_argv({
+        session = sname,
+        idle_exit = opts.idle_exit,
+        retain_exited = opts.retain_exited,
+        plugins = opts.plugins,
+        systemd_scope = opts.systemd_scope,
+      }, EXEFILE, DATADIR)
+      if dwarn then io.stderr:write("thither-server: ", dwarn, "\n") end
       local dpid, dcode, dmsg = serverio.daemonize(daemon_args)
       serverio.unlock(lock_fd)
       lock_fd = nil
@@ -263,30 +252,30 @@ end
 -- Bidirectional raw byte pump loop. fd 0/1 in the poll set and the fd-less
 -- read/write name the protocol channel (serverio keeps the real stdio there).
 local MAX_BUF = 262144
-local DRAIN_IDLE = 1      -- after stdin EOF: wait this long for more daemon output
-local DRAIN_MAX = 1       -- shutdown(SHUT_WR) cuts the drain wait to at most 1s
+-- after the half-close the daemon finishes the requests in flight for up to
+-- session.EOF_DRAIN_MS and then closes; the relay waits for that close, with
+-- a 1 s margin because the daemon may close right at its own deadline
+local DRAIN_MARGIN = 1
 local in_buf = ""
 local out_buf = r:unread_bytes()
 local stdin_eof = false
 local sock_eof = false
 local half_closed = false
-local drain_start, drain_last
+local drain_deadline
 
 local function has(ev, ch) return ev ~= nil and ev:find(ch, 1, true) ~= nil end
 
 while true do
   -- stdin is done and everything it sent reached the daemon: half-close the
-  -- write half of the socket, then wait at most 1s for the daemon to answer
+  -- write half of the socket, then keep relaying the daemon's output until it
+  -- closes (it does as soon as nothing is left in flight) or the deadline
   if stdin_eof and #in_buf == 0 and not half_closed then
     serverio.shutdown(sock_fd, "w")
     half_closed = true
-    drain_start, drain_last = now(), now()
+    drain_deadline = now() + session.EOF_DRAIN_MS / 1000 + DRAIN_MARGIN
   end
   if sock_eof and #out_buf == 0 then break end
-  if drain_start and #out_buf == 0 then
-    local t = now()
-    if t - drain_last >= DRAIN_IDLE or t - drain_start >= DRAIN_MAX then break end
-  end
+  if drain_deadline and now() >= drain_deadline then break end
 
   local poll_map = {}
   if not stdin_eof and #in_buf < MAX_BUF then poll_map[0] = "r" end
@@ -299,9 +288,8 @@ while true do
   if #out_buf > 0 then poll_map[1] = "w" end
 
   local timeout = 1000
-  if drain_start then
-    timeout = math.ceil(math.max(0, math.min(drain_last + DRAIN_IDLE, drain_start + DRAIN_MAX) - now()) * 1000)
-    if #out_buf > 0 then timeout = 1000 end
+  if drain_deadline then
+    timeout = math.min(timeout, math.max(0, math.ceil((drain_deadline - now()) * 1000)))
   end
   local rev = serverio.poll(poll_map, timeout) or {}
 
@@ -344,7 +332,6 @@ while true do
       sock_eof, in_buf = true, ""
     elseif #data > 0 then
       out_buf = out_buf .. data
-      if drain_start then drain_last = now() end
     end
   end
 end

@@ -1,16 +1,25 @@
 # Persistent remote sessions for thither-server: plan
 
-Status (2026-10-09):
+Status (2026-10-12):
 
-- **Phases 0-2 are fully implemented on the server.** That is the multi-connection
-  core, `serverio` sockets/poll/shutdown, `serverpty` (PTY and pipe modes), the session
-  daemon and relay, environment forwarding, and all review follow-up tasks.
-- **Phases 3-6 are not started.** That covers procs, the clients and polish.
-- See [Implementation status](#implementation-status) for what is done in each phase.
+- **Phases 0-2 are implemented on the server**, including the 2026-10-12
+  review fixes and the phase 2 leftovers (relay drain, test isolation,
+  `--systemd-scope`):
+  - `--root` and `--log` really are per connection;
+  - the daemon drains replies after a connection's EOF;
+  - the daemon ignores `SIGHUP`;
+  - pipe-mode signals reach the whole job.
+- **All three clients support sessions** for files: the `session` option,
+  skew and restart notices, session-info and restart-session commands.
+- **Phases 3-6 are not started.** That covers procs, terminals, jobs and polish.
+- See [Implementation status](#implementation-status) for what is done, and
+  [Leftover work](#leftover-work) for what was finished on 2026-10-12 and
+  what is left.
 
-The plan was also revised for the repository split, libeditingcore, the
-embedded modules and the 2026-10-09 server fixes (see
-[Changes since the first draft](#changes-since-the-first-draft)).
+The plan was revised on 2026-10-09 for the repository split, libeditingcore,
+the embedded modules and the server fixes. It was revised again on 2026-10-12
+for the Neovim client, the commit-pinned libeditingcore and the review fixes
+(see [Changes since the first draft](#changes-since-the-first-draft)).
 
 This plan turns `thither-server` from a "lives as long as the ssh session"
 helper into a persistent per-user session daemon that also hosts terminals and
@@ -26,6 +35,7 @@ Contents: [Motivation](#motivation) | [Goals](#goals-and-non-goals) |
 [Clients](#clients) | [Security](#security) | [Phases](#phases) |
 [Testing](#testing) | [Risks](#risks-and-open-questions) |
 [Implementation status](#implementation-status) |
+[Leftover work](#leftover-work) |
 [Changes since the first draft](#changes-since-the-first-draft)
 
 ## Motivation
@@ -196,8 +206,11 @@ The relay does the following:
 
 ### Options and multiple relays
 
-The first relay's command line decides the daemon's options. Later relays send
-theirs in the preamble.
+The relay that starts the daemon passes only the daemon-wide options
+(`--plugins`, `--datadir`, `--idle-exit`, `--retain-exited`) on its command
+line. It never passes `--root` or `--log`, so the daemon has no jail of its
+own. Every relay, the first one included, sends its per-connection options in
+the preamble.
 
 | option | scope | mismatch policy |
 |---|---|---|
@@ -252,8 +265,8 @@ preamble frame, and the `serverio` multi-fd poll from
 [Server internals](#server-internals).
 
 ```
-relay -> daemon   { ev="relay", relay_version, pid, env={...}, opts={root=,log=,plugins={...}} }
-daemon -> relay   { ev="relay_ok", daemon_version, daemon_pid, session=NAME }
+relay -> daemon   { ev="relay", relay_version, build_id, pid, env={...}, opts={root=,log=,plugins={...}} }
+daemon -> relay   { ev="relay_ok", daemon_version, daemon_build, daemon_pid, daemon_plugins, session=NAME }
                 | { ev="relay_ok", err={code=..., msg=...} }   -- then the relay forwards an
                                                                -- error hello to the client and exits 2
 then: raw byte copy client<->daemon, both directions, until EOF on either side
@@ -265,7 +278,10 @@ then: raw byte copy client<->daemon, both directions, until EOF on either side
 - Buffering: at most 1 MiB in each direction. Stop reading the side whose
   peer is not draining (back-pressure goes all the way to ssh).
 - EOF on stdin: shut down the write half of the socket, wait at most 1 s for
-  the daemon to finish, then exit 0.
+  the daemon to finish, then exit 0. The daemon itself keeps a connection
+  open after its EOF until its pending replies are flushed, for at most 5 s
+  (`EOF_DRAIN_MS`). A reply that takes longer than the relay's 1 s is still
+  lost (see [Leftover work](#leftover-work)).
 - EOF from the daemon: flush stdout, then exit 0.
 - `SIGHUP`/`SIGTERM`: exit immediately. The daemon notices the closed socket
   and drops the connection (its procs keep running).
@@ -568,9 +584,11 @@ serverpty.proc_cwd(pid), serverpty.proc_name(pid)        -> string | nil   (best
 - `lua/thither/relay.lua` and `ops_procs.lua` are embedded with the other
   modules (`src/embed.c`). There is nothing to install beyond the binary, and
   `--extract-data` writes them out.
-- Any changes needed in libeditingcore (e.g. a pollable fd for `process.c`
-  pipes) go into a tagged release, then into the `FetchContent` tag in
-  thither and lite-xl.
+- thither and lite-xl pin libeditingcore by full commit hash (`GIT_TAG`).
+  Any change needed there, such as a pollable fd for `process.c` pipes, is
+  committed in libeditingcore. Both pins are then bumped in the same pass, as
+  `libeditingcore/AGENTS.md` requires. The commit has to be pushed before a
+  fresh `FetchContent` build can resolve it.
 
 ## Clients
 
@@ -659,6 +677,32 @@ connection and `exec` streams do not. Reuse the client machinery:
 - Reconnect handling mirrors the shared client: keep the buffer, show the
   state in the mode line, and resume from the offset after reconnecting.
 
+### Neovim: `thither.nvim` (thither.nvim repository, phase 5b)
+
+thither.nvim was added after the first draft (2026-10-11). It has files,
+directories and large files, but no `exec`, procs or session support yet.
+
+- **Opt-in.** Add a `session` host option, as in Lite XL, that adds
+  `--session <name>` to the remote command. `Client.ensure` already
+  reconnects, so files work through a session as soon as that option exists.
+- **Backend: `nvim_open_term`.** Neovim's built-in terminal emulator can be
+  driven from any byte source:
+  - `proc_data` goes in through `nvim_chan_send`;
+  - keystrokes come back through the `on_input` callback as `proc_input`;
+  - `proc_resize` follows the window size (`WinResized`).
+  
+  There is no emulator to choose, so this phase is small.
+- **Callbacks.** Handlers run through `vim.schedule`, as the client does
+  today. A `proc_attach` reply that arrives after a timeout gets
+  `proc_detach`, not `proc_close`.
+- **Commands:**
+  - `:ThitherTerm`, and `:ThitherTermAttach` (`vim.ui.select` over
+    `proc_list`);
+  - `:ThitherJobs`, `:ThitherRunJob`;
+  - `:ThitherSessionInfo`, `:ThitherRestartSession`.
+- **Reconnect.** On reconnect, keep the terminal buffer, show the link state
+  in the winbar, and resume from the last offset.
+
 ### Plain terminal: `thither-server attach` (phase 6, optional)
 
 - `thither-server --session NAME attach [proc|name]`, run *on the remote
@@ -702,6 +746,7 @@ Each phase is shippable and keeps the existing suites green.
 | 3 | `procs` ops: pty + pipe, ring, attach/resume/gap, flow control, redraw nudge, alt-screen hint, disk log, `proc_read` | `lua/thither/ops_procs.lua` | Protocol tests (below). Doc section added to `protocol.md`. |
 | 4 | Lite XL: client reconnect for procs, jobs UI, terminal view (backend chosen after the evaluation in 4a) | lite-xl: `data/plugins/thither/client.lua`, new `data/plugins/thither/procs.lua`, plugin or native vterm; synced to lite-xl-plugins | lite-xl `tests/remote_client/test_procs.lua`, in WSL and with `run.ps1 -Host`. Manual check over plink against a real host. |
 | 5 | Emacs `thither-term.el` (eat backend), `thither-jobs` | thither.el: `thither-term.el`, `test/thither-term-test.el` | ERT tests via `test/all.sh remote` from WSL Emacs, as for the existing suites. |
+| 5b | Neovim `session` option, terminals over `nvim_open_term`, jobs | thither.nvim: new `lua/thither/term.lua`, `tests/test_term.lua` | Offline tests with the fake server, plus live tests via `THITHER_SERVER` / `tests/run.sh`; e2e from Windows nvim over plink. |
 | 6 | Polish: titles/cwd/fg in list, plain-terminal `attach`/`ls`, recreate state file, macOS/BSD verification | `ops_procs.lua`, `relay.lua`, `pty.c` | Tests per item. macOS run recorded in Limitations. |
 
 Rough size (excluding the terminal emulator choice):
@@ -777,10 +822,14 @@ the repo):
   the installed binary, and run the suites against the copy. Move it into
   place only after they pass, keeping the old binary.
 - **Lite XL:** `tests\remote_client\run.ps1 -Host <session> -Server <path>`.
-  Use `-BigMB` of at least 512: the large-file tests address lines past 6
-  million.
+  The large-file tests derive their line numbers from the file size, so any
+  `-BigMB` works; 300 is the usual value.
 - **Emacs:** `THITHER_SERVER="plink.exe -ssh -batch -T <session> <path> --stdio" test/all.sh remote`
-  from WSL Emacs.
+  from WSL Emacs. WSL's own ssh usually has no key, so use Windows
+  `plink.exe` through interop with `-load <session>`.
+- **Neovim:** Windows nvim with
+  `ssh_command = { "plink.exe", "-batch", "-T", "-load" }`. The host spec
+  is the PuTTY session name. Use the real `PLINK.EXE`, not a scoop shim.
 
 Manual, before each phase lands:
 
@@ -823,15 +872,21 @@ Manual, before each phase lands:
 
 ## Implementation status
 
-As of 2026-10-09: `b88e5bb` (phases 0-2 merged) plus the session review
-fixes on top of it.
+As of 2026-10-12: `5687b34` (the 2026-10-12 review fixes, on top of the
+phases 0-2 merge `b88e5bb` and the 2026-10-09 session fixes).
 
-- The full server suite passes, 160 tests, in both the dynamic and the static
-  build.
-- A real old-glibc host (kernel 4.18, so the `close_range` fallback paths
-  ran) passed the server suite, the Lite XL remote client suite and the
-  Emacs suites. The Emacs suites ran both in stdio mode and through
-  `--session`, with one daemon serving every connection.
+- The full server suite passes, 179 tests (after the phase 2 leftovers), in both the dynamic and the static
+  build. With `--datadir` and with the embedded modules, the
+  `DATADIR`-only embed tests skip.
+- The static build was tested on a real old-glibc host (RHEL 8, kernel 4.18,
+  glibc 2.28, SELinux enforcing). On that kernel the `close_range` fallback
+  runs. These all passed:
+  - the server suite: 179/179 with and without `--datadir`;
+  - the Lite XL remote client suite plus e2e from the installed build:
+    107/107;
+  - thither.el ERT (137) and e2e (11) from WSL Emacs over plink. The e2e also
+    ran through `--session` and reconnected to the same `daemon_pid`;
+  - thither.nvim e2e (220 checks) from Windows nvim over plink.
 
 ### Phase 0: multi-connection core. Done
 
@@ -877,7 +932,11 @@ fixes on top of it.
   - `close_range` falls back to a loop on old kernels;
   - array-style `env` is accepted;
   - `open{tty=false}` pipe mode (pipes with stdout and stderr merged, child in
-    its own process group, stdin connected to `/dev/null`).
+    its own session and process group, stdin connected to `/dev/null`);
+    `signal` sends to the whole group (`kill(-pid)`) when there is no
+    foreground tty;
+  - errors return `nil, code, msg` like the rest of `serverio`; `EINVAL` is
+    used for bad arguments.
 - Build checks: `CMakeLists.txt` detects `close_range` and `ptsname_r` via
   `check_symbol_exists` (`HAVE_CLOSE_RANGE`, `HAVE_PTSNAME_R`).
 - Socket type: `serverfs.stat` reports sockets as `type="socket"` for `S_ISSOCK`.
@@ -894,25 +953,37 @@ fixes on top of it.
   - the socket path is checked to be our own socket before connect or
     remove;
   - `daemon.log` rotates at 1 MiB;
-  - NSS-free directory resolution (checks `$USER` / `$LOGNAME` before `getpwuid`).
+  - NSS-free directory resolution: `$XDG_RUNTIME_DIR` or
+    `/tmp/thither-server-<uid>`, and `$XDG_STATE_HOME` or `$HOME`, with
+    `getpwuid` only as a fallback for the home dir. The displayed user name
+    (`host_info.user`) prefers `getpwuid`, then `$USER` / `$LOGNAME`.
 - Relay:
   - start-up under `flock`;
   - the preamble / `relay_ok` handshake: a bad preamble is refused for that
     connection only and never ends the daemon;
   - forwards environment (`SSH_*`, `LC_*`, `DISPLAY`, `WAYLAND_DISPLAY`,
     `TERM`, `TERM_PROGRAM`, `COLORTERM`, `LANG`) and configurable `--forward-env`;
-  - forwards preamble options: `--root`, per-connection request `--log`, and
-    `--plugins` mismatch reporting;
-  - version skew checks on both sides comparing version and `build_id`;
+  - forwards preamble options: `--root` and request `--log`, both truly per
+    connection (the daemon is started without them, and a relative `--log` is
+    made absolute), and `--plugins` mismatch reporting;
+  - the preamble is validated (`log`, `plugins`, `relay_version`, `build_id`)
+    inside the pcall;
+  - version skew checks on both sides, comparing version and `build_id`;
+    `session_info` and `hello` share one helper;
   - half-close via `serverio.shutdown(sock, "w")` after stdin EOF;
   - a raw byte copy without busy polling;
-  - replies in flight are delivered after stdin EOF.
+  - replies in flight are delivered after stdin EOF: the daemon stops reading
+    the connection, finishes running requests and flushes them, for at most
+    5 s.
 - Daemon:
   - the hello `session` table, `host_info.session_name`, `session_info` and
     `session_shutdown`;
   - `session_closing` is delivered at shutdown, with a bounded drain;
   - backs off on `accept` errors (`EMFILE`);
-  - `SIGTERM` shuts down cleanly.
+  - `SIGTERM` shuts down cleanly; `SIGHUP` is ignored in daemon mode (stdio
+    servers and relays still end on it);
+  - `remove`, `rename`, `symlink` and `link` refuse the jail root under
+    either spelling (realpath or symlinked).
 - `agent.sock` only ever points at a socket owned by the current uid.
 - Documentation: `session_info` / `session_shutdown` and hello `session` table
   documented in op tables in `docs/protocol.md`.
@@ -924,6 +995,67 @@ fixes on top of it.
     timeouts, clean idle exit, `SIGTERM` shutdown, accept back-off, and the agent symlink;
   - per-connection `--log`, `--plugins` mismatch, version skew, extended env forwarding.
 - The `--session` section of `docs/protocol.md` and the CHANGELOG entry.
+
+## Leftover work
+
+### Phase 2 loose ends: done (2026-10-12)
+
+- **Relay drain.** The relay now forwards after stdin EOF until the daemon
+  closes its side, bounded by `session.EOF_DRAIN_MS` (5 s, shared with the
+  daemon) plus 1 s. Tested with a 2 s plugin op behind a real relay.
+- **Files left after exit: kept on purpose.** A clean exit keeps the 0-byte
+  `<runtime>/<name>.lock` (the next start reuses it) and
+  `<state>/<name>/daemon.log` (for post-mortems). Removing the lock safely
+  would need a dev/inode re-check after `flock` in `serverio.lock`; without
+  it two daemons can own one session. Documented in `docs/protocol.md`.
+- **Test isolation.** The leaked `s_*` / `sess_*` dirs came from
+  `test_session.lua` itself, not from the client suites. Every session test
+  now runs with its own `XDG_RUNTIME_DIR` / `XDG_STATE_HOME`
+  (`Client.spawn{env_extra=}`), and the client suites' session tests do the
+  same or clean up their uniquely named sessions.
+- **Logout kill.** The README has a "Sessions" section with the
+  `loginctl enable-linger` workaround. A new opt-in relay flag
+  `--systemd-scope` starts the daemon under `systemd-run --user --scope`.
+  That survives the end of one login session, but not a full logout without
+  linger.
+- **Two roots on one session.** This is now covered by the Lite XL client test
+  as well as the server suite.
+
+Before this work, a real old-glibc host had 57 old `s_*` / `sess_*` state
+dirs and 44 lock files from earlier server test runs. They are left for
+manual removal.
+
+### Session opt-in in the clients: done (2026-10-12)
+
+Each client has a `session` host option (`true` means `"default"`, or give a
+name matching `[A-Za-z0-9._-]{1,32}`). The option adds `--session <name>`
+right after `--stdio`. On each hello the client shows:
+
+- a skew notice, once per host and daemon_pid;
+- an old-server notice, when the option is set but the hello has no
+  `session` table;
+- a restarted notice, when the daemon_pid changes. After the client's own
+  restart command this is info instead of a warning.
+
+`session_closing` is logged.
+
+| Client | `session` option | notices | session-info | restart-session | tests |
+|---|---|---|---|---|---|
+| Lite XL (lite-xl, synced to lite-xl-plugins) | `hosts[label].session` | `vfs.check_session` | `thither:session-info` | `thither:restart-session` (nag confirm) | `test_connect`, new `test_session.lua`, real-host e2e |
+| Emacs (thither.el) | `:session` in `thither-host-options` | `display-warning 'thither` | `thither-session-info` | `thither-restart-session` (`yes-or-no-p`) | offline ERT, `test/run.sh session`, real-host e2e |
+| Neovim (thither.nvim) | `session` (per host via `hosts`) | `vim.notify` WARN | `:ThitherSessionInfo` | `:ThitherRestartSession` (`confirm`) | `test_offline`, new live `test_session.lua`, real-host e2e |
+
+Real-host checks for all three clients:
+
+- killing plink reconnects to the same daemon_pid with no notice, and saves
+  still work;
+- restart-session gives a new pid and one notice;
+- a daemon from a build with another `build_id` gives exactly one skew
+  notice.
+
+Skew needs a binary that already sends and compares `build_id`; older
+builds compare only the version string. Neovim also gained plink `-P` port
+handling.
 
 ### Phases 3-6. Not started
 
@@ -942,7 +1074,11 @@ fixes on top of it.
   - The terminal emulator choice (4a) comes first.
   - `tests/remote_client/test_procs.lua`.
 - **5, Emacs.** thither.el: `thither-term.el` (eat backend), `thither-jobs`,
-  `thither-run-job`, `thither-session-info`, ERT tests.
+  `thither-run-job`, `thither-session-info`, ERT tests. Exec processes do not
+  survive a reconnect today; that is expected until procs exist.
+- **5b, Neovim.** thither.nvim: the `session` option, terminals over
+  `nvim_open_term`, jobs, tests. thither.nvim has no `exec` support either,
+  so it may want an `exec` bridge (`:!`, `jobstart` equivalents) first.
 - **6, polish.**
   - `title` / `cwd` / `fg` in `proc_list`;
   - `thither-server --session NAME attach` / `ls`;
@@ -951,8 +1087,19 @@ fixes on top of it.
 
 ## Changes since the first draft
 
-Revised 2026-10-09. The design is unchanged. These are the facts it now
-builds on:
+The design is unchanged. These are the facts it now builds on, newest
+first.
+
+Revised 2026-10-12:
+
+| Change | Effect on this plan |
+|---|---|
+| New Neovim client, thither.nvim (files, directories, large files; no `exec`) | A [Neovim section](#neovim-thithernvim-thithernvim-repository-phase-5b) and phase 5b. `nvim_open_term` makes its terminal backend cheap. |
+| libeditingcore is pinned by commit hash, with a rule (`libeditingcore/AGENTS.md`) to bump thither and lite-xl on every commit | [Build and install](#build-and-install) no longer waits on a tagged release. |
+| `--root` / `--log` are truly per connection; the daemon drains replies after EOF; `SIGHUP` ignored in daemon mode; pipe-mode signals reach the job; `serverpty` errors are `nil, code, msg` | [Options](#options-and-multiple-relays), [Relay](#relay) and [Implementation status](#implementation-status) updated. The relay's 1 s drain is now the limiting factor ([Leftover work](#leftover-work)). |
+| Real-host runs now cover all three clients | [Testing](#testing) lists the Neovim setup and the plink `-load` form. |
+
+From the 2026-10-09 revision:
 
 | Change | Effect on this plan |
 |---|---|

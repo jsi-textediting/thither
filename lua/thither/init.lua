@@ -40,9 +40,6 @@ local OUT_HIGH_WATER = 32 * 1024 * 1024
 local FRAMES_PER_TURN = 256
 local IDLE_WAIT_MS = 1000
 local ACCEPT_BACKOFF_MS = 100
--- after EOF on a daemon connection (a relay half-closes after its stdin EOF):
--- how long its requests in flight may still run and their replies drain
-local EOF_DRAIN_MS = 5000
 
 ---------------------------------------------------------------------------
 -- logging
@@ -1160,7 +1157,7 @@ local function main_daemon()
             -- EOF): run the frames already read, let the requests in flight
             -- finish and their replies drain, then close (end of the turn)
             c.read_eof = true
-            c.drain_deadline = system.get_time() + EOF_DRAIN_MS / 1000
+            c.drain_deadline = system.get_time() + session.EOF_DRAIN_MS / 1000
             server.log("connection %d: end of input (%s), finishing its requests", c.id, tostring(err))
           end
         end

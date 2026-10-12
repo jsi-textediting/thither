@@ -216,8 +216,8 @@ Symlinks are followed (the table describes the target and carries
 | `watch` / `unwatch` | see [Events](#events) | |
 | `exec`, `stdin`, `stdin_close`, `kill`, `ack` | see [Events](#events) | |
 | `call` | `service`, `method`, `args` | whatever the plugin method returns |
-| `session_info` | - | `{name, daemon_pid, started, version, version_skew, plugins, connections}` in daemon mode (`session` cap); `bad_request` in stdio mode |
-| `session_shutdown` | `timeout_ms=2000` | `true`, then daemon broadcasts `{ev="session_closing"}`, drains and terminates (`session` cap); `bad_request` in stdio mode |
+| `session_info` | - | `{name, daemon_pid, started, version, version_skew, plugins, connections, procs, rings_bytes}` in daemon mode (`session` cap; `procs` and `rings_bytes` are 0 until persistent procs exist); `bad_request` in stdio mode |
+| `session_shutdown` | `timeout_ms=2000` | `true`, then daemon broadcasts `{ev="session_closing"}`, drains for up to `timeout_ms` (clamped to 0-60000) and terminates (`session` cap); `bad_request` in stdio mode |
 
 ### write
 
@@ -367,6 +367,19 @@ search { path, pattern, opts={regex=false, case=true, limit=1000}, from_off=0, e
 
 Events are server -> client frames with an `ev` field.
 
+### session_closing
+
+```
+{ ev="session_closing" }
+```
+
+* Daemon mode only (`session` cap). Sent to every connection whenever the
+  daemon exits: after `session_shutdown` (or `--kill`), on SIGTERM/SIGINT
+  and on the idle exit. Pending output is then drained (for up to the
+  `session_shutdown` `timeout_ms`, default 2000 ms) and the connection
+  closes; the relay exits and the client sees the usual disconnect.
+* The next `--session` relay starts a fresh daemon (a new `daemon_pid`).
+
 ### exec
 
 ```
@@ -475,6 +488,8 @@ tests.
 
 ```
 thither-server [--stdio] [--root <dir>] [--log <file>] [--plugins <dir>]... [--datadir <dir>]
+thither-server --stdio --session [<name>] [--idle-exit <sec>] [--systemd-scope] [--forward-env <vars>] [same options]
+thither-server --session [<name>] --kill                        -- shut a session daemon down
 thither-server --version | --help
 thither-server [--datadir <dir>] --run <script.lua> [args...]   -- run a Lua script with the server libraries
 thither-server --extract-data <dir>                             -- write the built-in Lua modules to <dir>
@@ -493,16 +508,40 @@ thither-server --extract-data <dir>                             -- write the bui
     its connection and its `--log` gets that connection's request log. The
     daemon itself has no root and logs to `<state>/daemon.log`.
   * On stdin EOF the relay still sends what it read, half-closes the socket
-    and forwards the daemon's output for at most 1 s, then exits 0. After
-    EOF the daemon finishes the requests in flight and drains their replies
-    (at most 5 s) before it closes the connection.
+    and keeps forwarding the daemon's output until the daemon closes the
+    connection, then exits 0. After EOF the daemon finishes the requests in
+    flight and drains their replies (at most 5 s, `session.EOF_DRAIN_MS`)
+    and closes as soon as nothing is left, so an idle relay exits at once.
+    The relay gives up 1 s after the daemon's deadline (6 s after the
+    half-close) or when its stdout is gone.
   * `--kill` gives up (exit 1) after 5 s without an answer.
+  * `--idle-exit <sec>` (default 600) and `--retain-exited <sec>` are passed
+    to the daemon the relay starts; they have no effect on a running one.
+  * Files: the socket and lock are `<run>/<name>.sock` and `<run>/<name>.lock`,
+    where `<run>` is `$XDG_RUNTIME_DIR/thither-server` (or
+    `/tmp/thither-server-<uid>`); the state directory is
+    `<state>/<name>/` under `$XDG_STATE_HOME/thither-server` (or
+    `~/.local/state/thither-server`), with `daemon.log` (rotated to
+    `daemon.log.1` at 1 MB) and the `agent.sock` link. The socket and
+    `agent.sock` are removed on a clean exit; the 0-byte lock file and the
+    logs are kept on purpose after any exit, and the next start reuses the
+    lock (removing it safely would need an inode re-check after `flock`).
+  * `--systemd-scope` (off by default): when the relay starts the daemon and
+    `systemd-run` is on `PATH`, it runs it as
+    `systemd-run --user --scope --quiet -- thither-server --daemon ...`, in a
+    transient user scope outside the login session, which systemd-logind's
+    `KillUserProcesses=yes` does not kill with that session. The user
+    manager (and its scopes) still stops after the user's last session ends
+    unless lingering is enabled (`loginctl enable-linger`, see the README).
+    Without `systemd-run` the relay warns on stderr and starts the daemon as
+    usual. The daemon keeps its pid (`systemd-run --scope` execs it).
   * The runtime and state directories must be ours, mode `0700` and not
     symlinks; an existing one with another mode is refused, not chmod'ed. The
     socket path must be absent or a socket of ours. The `agent.sock` link
     only points at an `SSH_AUTH_SOCK` that is a socket owned by us.
-  * On shutdown the daemon sends `session_closing` and drains pending output
-    for up to `timeout_ms` of `session_shutdown` (default 2000 ms).
+  * On any exit the daemon sends `session_closing` and drains pending output
+    for up to `timeout_ms` of `session_shutdown` (default 2000 ms, clamped
+    to 0-60000).
 * `--root <dir>` jails all non-exec file ops to the realpath of `<dir>`.
 * `--log <file>` appends a request log.
 * **Single file.** The server's Lua modules (`lua/thither/*.lua`) are compiled
@@ -591,7 +630,10 @@ cancel), `test_fs`, `test_exec_watch`, `test_large` (reference-model and
 sparse file), `test_embed` (a lone binary with no data directory, `--datadir`
 override and fallback, `--extract-data`; skipped when nothing is embedded),
 `test_copies` (Lite XL's copies of `msgpack.lua` and `frame.lua` in
-`data/plugins/thither/` match `lua/thither/`). They need `sh`, `dd`, `cmp`, `wc`,
+`data/plugins/thither/` match `lua/thither/`), `test_session` (relay, daemon
+and lifecycle; every session runs under a temporary `XDG_RUNTIME_DIR` /
+`XDG_STATE_HOME`, removed at the end, so the real per-user directories get
+no test sessions). They need `sh`, `dd`, `cmp`, `wc`,
 `yes`, `truncate` and about 1.5 GB of free space in `/tmp` (override with
 `THITHER_TEST_TMP`). The whole suite takes about 25 s. Real `ssh`/`plink`
 sessions are not covered by it.
