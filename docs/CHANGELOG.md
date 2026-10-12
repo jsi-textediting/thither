@@ -12,6 +12,42 @@ The wire protocol is versioned by a single integer (`proto_version`, still
 
 ## Unreleased
 
+### Server C fixes (2026-10-12)
+
+* The session daemon ignores `SIGHUP`, as documented; only `SIGTERM`/`SIGINT`
+  shut it down.
+* `serverpty.signal` without a terminal `fg_fd` (pipe mode) signals the
+  child's whole process group, so a `tty=false` job's children are reached.
+* `serverpty.*` and `serverio.shutdown` failures return `nil, code, message`
+  (code an errno name such as `ENOENT`, `ENOTTY`, `EINVAL`), like `accept` and
+  `daemonize`; `serverpty.open` used to return the message first.
+* `serverio.poll({}, t)` waits `t` ms (forever for nil) with no overflow on
+  long timeouts, and a signal ends the wait.
+* Spawned children no longer inherit descriptors above 65536 on kernels
+  without `close_range`.
+* `host_info.user` is the passwd name of the server's uid again; `$USER` /
+  `$LOGNAME` are only a fallback when the lookup fails.
+
+### Session Lua fixes (2026-10-12)
+
+* `--root` and `--log` are per connection, as specified: the relay that
+  starts the daemon no longer passes them on its command line, so later
+  relays are neither jailed to the first relay's root nor logged into its
+  request log. The daemon logs to `<state>/daemon.log`. A relative `--log` is
+  made absolute by the relay, like `--root`.
+* After EOF on a connection (a relay half-closing after its stdin EOF) the
+  daemon runs the frames already received, lets the requests in flight
+  finish and drains their replies (at most 5 s) before closing; large or
+  asynchronous replies used to be truncated or cancelled.
+* Preamble `opts.log`, `opts.plugins`, `relay_version` and `build_id` are
+  validated; a malformed value is refused for that connection instead of
+  ending the daemon.
+* `stat{nofollow}` of the root in its symlinked spelling works; `rename`,
+  `symlink` and `link` refuse to replace the root in either spelling.
+* `session_info.version_skew` includes the relay's `build_id`, as the hello
+  `session` table does.
+* The relay reports `daemonize` failures with their message.
+
 ### Session fixes (2026-10-09)
 
 * A bad relay preamble (root outside the jail or through an escaping

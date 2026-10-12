@@ -237,6 +237,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "thither-server: cannot set up stdio\n");
     return 1;
   }
+  /* a session daemon outlives terminals and relays: it ignores SIGHUP and
+  ** shuts down only on SIGTERM/SIGINT (docs/sessions-plan.md, Lifecycle) */
+  if (is_daemon) signal(SIGHUP, SIG_IGN);
 
   lua_State *L = luaL_newstate();
   luaL_openlibs(L);

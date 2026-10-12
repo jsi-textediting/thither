@@ -15,6 +15,7 @@ function U.sh(cmd)
   local f = io.open(out_file, "rb")
   local out = f and f:read("a") or ""
   if f then f:close() end
+  os.remove(out_file)
   local rf = io.open(rc_file, "rb")
   local code = rf and tonumber(rf:read("a"):match("%d+"))
   if rf then rf:close() end

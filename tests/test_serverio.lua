@@ -266,6 +266,21 @@ H.test("serverio: shutdown half-closes socket descriptor", function()
   serverio.close(cfd)
   serverio.close(afd)
   serverio.close(lfd)
+
+  -- failures are nil, code, message
+  local sok, scode, smsg = serverio.shutdown(cfd, "w")
+  H.eq(sok, nil)
+  H.eq(scode, "EBADF")
+  H.ok(type(smsg) == "string" and #smsg > 0)
   U.cleanup()
+end)
+
+H.test("serverio: poll with no descriptors still waits", function()
+  local t0 = system.get_time()
+  H.eq(next(serverio.poll({}, 50)), nil)
+  H.ok(system.get_time() - t0 >= 0.04, "poll({}, 50) should wait about 50 ms")
+  t0 = system.get_time()
+  serverio.poll({}, -1)
+  H.ok(system.get_time() - t0 < 0.04, "a negative timeout does not wait")
 end)
 

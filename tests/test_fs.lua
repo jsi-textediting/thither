@@ -24,6 +24,7 @@ H.test("fs: stat of file, dir, symlink and missing path", function()
   H.eq(l.type, "file"); H.eq(l.is_link, true); H.eq(l.link, "f.txt"); H.eq(l.size, 6)
   l = c:request("stat", { path = dir .. "/l", nofollow = true })
   H.eq(l.type, "symlink")
+  H.eq(c:request("stat", { path = dir .. "/dangling" }).type, "symlink")
   local serverio = require "serverio"
   local sfd = serverio.listen(dir .. "/sock")
   H.ok(sfd)

@@ -14,7 +14,8 @@ local function now() return system.get_time() end
 function Client.spawn(opts)
   opts = opts or {}
   local cmd = { opts.server or EXEFILE, "--stdio" }
-  if opts.datadir ~= false then
+  -- no --datadir when the runner has none (embedded modules)
+  if opts.datadir ~= false and (opts.datadir or DATADIR) then
     cmd[#cmd + 1] = "--datadir"
     cmd[#cmd + 1] = opts.datadir or DATADIR
   end

@@ -40,6 +40,9 @@ local OUT_HIGH_WATER = 32 * 1024 * 1024
 local FRAMES_PER_TURN = 256
 local IDLE_WAIT_MS = 1000
 local ACCEPT_BACKOFF_MS = 100
+-- after EOF on a daemon connection (a relay half-closes after its stdin EOF):
+-- how long its requests in flight may still run and their replies drain
+local EOF_DRAIN_MS = 5000
 
 ---------------------------------------------------------------------------
 -- logging
@@ -176,7 +179,7 @@ function server.path(p, nofollow, conn)
     server.raise("jail", "path is outside the server root")
   end
   local probe = norm
-  if nofollow and norm ~= root then
+  if nofollow and norm ~= root and norm ~= alias then
     -- the parent is inside the root too: norm is below it, lexically
     probe = norm:match("^(.*)/[^/]*$")
     if probe == "" then probe = "/" end
@@ -192,6 +195,19 @@ function server.path(p, nofollow, conn)
     if probe == "" then probe = "/" end
   end
   return norm
+end
+
+--- True when the folded path `path` (from server.path) names the jail root
+--- of `conn` itself: in either spelling, or as an entry that is not a symlink
+--- and resolves to it. Ops that replace or remove the final component
+--- (remove, rename, symlink, link) refuse it.
+function server.is_root(path, conn)
+  local root, alias = server.root_of(conn)
+  if not root then return false end
+  if path == root or path == alias then return true end
+  local st = serverfs.stat(path, true)
+  if not st or st.type == "symlink" or st.is_link then return false end
+  return serverfs.realpath(path) == root
 end
 
 --- Resolves a root requested by a client (set_root, relay preamble) the way
@@ -214,6 +230,19 @@ end
 -- built-in ops & info
 ---------------------------------------------------------------------------
 
+--- "<relay version> (<relay build_id>)" when the relay of `conn` runs another
+--- version or build than the daemon, nil otherwise (and outside a daemon).
+local function version_skew(conn)
+  if not (server.is_daemon and conn) then return nil end
+  local rv, rb = conn.relay_version, conn.relay_build
+  if rb == "" then rb = nil end
+  local v_diff = rv ~= nil and rv ~= server.version
+  local b_diff = rb ~= nil and server.build_id ~= nil and server.build_id ~= "" and rb ~= server.build_id
+  if not (v_diff or b_diff) then return nil end
+  if rb then return string.format("%s (%s)", rv or server.version, rb) end
+  return rv or server.version
+end
+
 local function info(conn)
   local names = {}
   for name in pairs(server.services) do names[#names + 1] = name end
@@ -235,24 +264,12 @@ local function info(conn)
     max_frame = server.max_frame,
   }
   if server.is_daemon then
-    local skew = nil
-    if conn then
-      local v_diff = conn.relay_version and conn.relay_version ~= server.version
-      local b_diff = conn.relay_build and conn.relay_build ~= "" and server.build_id and server.build_id ~= "" and conn.relay_build ~= server.build_id
-      if v_diff or b_diff then
-        if conn.relay_build and conn.relay_build ~= "" then
-          skew = string.format("%s (%s)", conn.relay_version or server.version, conn.relay_build)
-        else
-          skew = conn.relay_version or server.version
-        end
-      end
-    end
     res.session = {
       name = opts.session or "default",
       daemon_pid = system.get_process_id(),
       started = server.started_at,
       version = server.version,
-      version_skew = skew,
+      version_skew = version_skew(conn),
       plugins = opts.plugins or {},
       connections = #server.connections,
     }
@@ -302,7 +319,7 @@ server.ops.session_info = function(a, req)
     daemon_pid = system.get_process_id(),
     started = server.started_at,
     version = server.version,
-    version_skew = (c and c.relay_version and c.relay_version ~= server.version) and c.relay_version or nil,
+    version_skew = version_skew(c),
     plugins = opts.plugins or {},
     connections = #server.connections,
     procs = 0,
@@ -724,24 +741,49 @@ function Conn:handle_frame(msg)
     if msg.ev == "relay" then
       -- everything in the preamble comes from the client side: validate it
       -- without letting an error escape (it would end the whole daemon)
-      local ok, env, root, alias = pcall(function()
+      local ok, pre = pcall(function()
         if self.relay_info then server.raise("bad_request", "duplicate relay preamble") end
+        local v = {}
         local e = msg.env
         if e == nil then e = {} end
         if type(e) ~= "table" then server.raise("bad_request", "relay env must be a map") end
-        for k, v in pairs(e) do
-          if type(k) ~= "string" or type(v) ~= "string" then
+        for k, val in pairs(e) do
+          if type(k) ~= "string" or type(val) ~= "string" then
             server.raise("bad_request", "relay env must map strings to strings")
           end
         end
+        v.env = e
         local o = msg.opts
-        if o ~= nil and type(o) ~= "table" then server.raise("bad_request", "relay opts must be a map") end
-        local r, a
-        if o and o.root ~= nil then r, a = server.resolve_root(o.root, self) end
-        return e, r, a
+        if o == nil then o = {} end
+        if type(o) ~= "table" then server.raise("bad_request", "relay opts must be a map") end
+        if o.root ~= nil then v.root, v.alias = server.resolve_root(o.root, self) end
+        if o.log ~= nil then
+          if type(o.log) ~= "string" or o.log:sub(1, 1) ~= "/" or o.log:find("\0", 1, true) then
+            server.raise("bad_request", "relay opts.log must be an absolute path")
+          end
+          v.log = o.log
+        end
+        if o.plugins ~= nil then
+          if type(o.plugins) ~= "table" then server.raise("bad_request", "relay opts.plugins must be a list") end
+          local n, count = #o.plugins, 0
+          for _ in pairs(o.plugins) do count = count + 1 end
+          if count ~= n then server.raise("bad_request", "relay opts.plugins must be a list") end
+          for i = 1, n do
+            if type(o.plugins[i]) ~= "string" then
+              server.raise("bad_request", "relay opts.plugins must be a list of strings")
+            end
+          end
+          v.plugins = o.plugins
+        end
+        local rv, rb = msg.relay_version, msg.build_id
+        if rb == nil then rb = msg.relay_build end
+        if rv ~= nil and type(rv) ~= "string" then server.raise("bad_request", "relay_version must be a string") end
+        if rb ~= nil and type(rb) ~= "string" then server.raise("bad_request", "build_id must be a string") end
+        v.relay_version, v.relay_build = rv, rb
+        return v
       end)
       if not ok then
-        local e = type(env) == "table" and env or { code = "internal", msg = tostring(env) }
+        local e = type(pre) == "table" and pre or { code = "internal", msg = tostring(pre) }
         server.log("relay preamble refused: %s: %s", tostring(e.code), tostring(e.msg))
         self:send_final({ ev = "relay_ok", daemon_version = server.version,
                           daemon_pid = system.get_process_id(), session = opts.session or "default",
@@ -749,21 +791,24 @@ function Conn:handle_frame(msg)
         return false
       end
       self.relay_info = msg
-      self.relay_version = msg.relay_version
-      self.relay_build = msg.build_id or msg.relay_build
-      self.env = env
-      if root then self.root, self.root_alias = root, alias end
-      if msg.opts and msg.opts.log and type(msg.opts.log) == "string" then
-        if self.logfh then self.logfh:close() end
-        self.log_file = msg.opts.log
-        local lfh = io.open(msg.opts.log, "ab")
+      self.relay_version = pre.relay_version
+      self.relay_build = pre.relay_build
+      self.env = pre.env
+      if pre.root then self.root, self.root_alias = pre.root, pre.alias end
+      if pre.log then
+        if self.logfh then pcall(function() self.logfh:close() end) end
+        self.logfh = nil
+        self.log_file = pre.log
+        local lfh, lerr = io.open(pre.log, "ab")
         if lfh then
           serverfs.set_cloexec(lfh)
           self.logfh = lfh
+        else
+          server.log("connection %d: cannot open request log: %s", self.id, tostring(lerr))
         end
       end
-      if msg.opts and msg.opts.plugins and type(msg.opts.plugins) == "table" then
-        local p_req = table.concat(msg.opts.plugins, ",")
+      if pre.plugins then
+        local p_req = table.concat(pre.plugins, ",")
         local p_cur = table.concat(opts.plugins or {}, ",")
         if p_req ~= p_cur then
           server.log("connection %d: requested plugins (%s) differ from daemon plugins (%s)",
@@ -1018,9 +1063,15 @@ local function main_daemon()
     for _, c in ipairs(server.connections) do
       if not c.closed and c.fd then
         local ev = ""
-        if c.out_bytes < OUT_HIGH_WATER then ev = ev .. "r" end
+        -- after EOF the fd stays readable: polling it for "r" would spin
+        if c.out_bytes < OUT_HIGH_WATER and not c.read_eof then ev = ev .. "r" end
         if c.out_head <= c.out_tail then ev = ev .. "w" end
         if ev ~= "" then poll_map[c.fd] = ev end
+      end
+      if c.read_eof and not c.closed then
+        local rem = (c.drain_deadline - system.get_time()) * 1000
+        if rem < 0 then rem = 0 end
+        if rem < timeout then timeout = rem end
       end
     end
 
@@ -1090,20 +1141,27 @@ local function main_daemon()
     local dead = {}
     for i, c in ipairs(server.connections) do
       server.current_conn = c
-      if rev and rev[c.fd] and rev[c.fd]:find("w") then
+      local cev = rev and rev[c.fd]
+      -- after EOF a hang-up or error is only noticed by trying to write
+      local gone = c.read_eof and cev ~= nil and (cev:find("h", 1, true) or cev:find("e", 1, true)) ~= nil
+      if cev and (cev:find("w", 1, true) or gone) then
         c:flush()
       end
-      if c.peer_closed then
+      if c.peer_closed or (gone and c.out_head > c.out_tail) then
         c:close()
         table.insert(dead, i)
       else
-        if rev and rev[c.fd] and (rev[c.fd]:find("r") or rev[c.fd]:find("hup")) then
+        if not c.read_eof and cev and (cev:find("r") or cev:find("hup")) then
           local data, err = c.read_fn(262144)
           if data and #data > 0 then
             c.reader:feed(data)
           elseif data == nil then
-            c:close()
-            table.insert(dead, i)
+            -- the peer is done sending (a relay half-closes after its stdin
+            -- EOF): run the frames already read, let the requests in flight
+            -- finish and their replies drain, then close (end of the turn)
+            c.read_eof = true
+            c.drain_deadline = system.get_time() + EOF_DRAIN_MS / 1000
+            server.log("connection %d: end of input (%s), finishing its requests", c.id, tostring(err))
           end
         end
 
@@ -1112,8 +1170,9 @@ local function main_daemon()
           if not ok then
             c:close()
             table.insert(dead, i)
-          elseif more_or_code then
-            more_frames = true
+          else
+            c.more_frames = more_or_code and true or false
+            if more_or_code then more_frames = true end
           end
         end
       end
@@ -1139,6 +1198,28 @@ local function main_daemon()
         c:flush()
       end
     end
+
+    -- connections past their input EOF close once nothing is left in flight
+    -- and their output has drained (or at the drain deadline)
+    local removed = false
+    for j = #server.connections, 1, -1 do
+      local c = server.connections[j]
+      if not c.closed and c.read_eof then
+        local idle = not c.more_frames and next(c.requests) == nil and c.out_head > c.out_tail
+        if idle or c.peer_closed or system.get_time() >= c.drain_deadline then
+          if not idle and not c.peer_closed then
+            server.log("connection %d: drain deadline reached, closing with requests in flight", c.id)
+          end
+          c:close()
+        end
+      end
+      if c.closed then
+        server.log("connection %d closed", c.id)
+        table.remove(server.connections, j)
+        removed = true
+      end
+    end
+    if removed then update_agent_symlink() end
 
     tick_hint = IDLE_WAIT_MS
     for _, ticker in ipairs(server.tickers) do

@@ -143,25 +143,20 @@ if not sock_fd then
         table.insert(daemon_args, "--datadir")
         table.insert(daemon_args, DATADIR)
       end
-      if opts.root then
-        table.insert(daemon_args, "--root")
-        table.insert(daemon_args, opts.root)
-      end
-      if opts.log then
-        table.insert(daemon_args, "--log")
-        table.insert(daemon_args, opts.log)
-      end
+      -- --root and --log are per connection: they go in the preamble only.
+      -- The daemon has no jail of its own and logs to <state>/daemon.log.
       if opts.plugins then
         for _, p in ipairs(opts.plugins) do
           table.insert(daemon_args, "--plugins")
           table.insert(daemon_args, p)
         end
       end
-      local ok, derr = serverio.daemonize(daemon_args)
+      local dpid, dcode, dmsg = serverio.daemonize(daemon_args)
       serverio.unlock(lock_fd)
       lock_fd = nil
-      if not ok then
-        io.stderr:write("thither-server: cannot spawn daemon: ", tostring(derr), "\n")
+      if not dpid then
+        io.stderr:write("thither-server: cannot spawn daemon: ", tostring(dcode),
+          dmsg and (": " .. tostring(dmsg)) or "", "\n")
         return 1
       end
 
@@ -212,13 +207,17 @@ local function collect_env(forward_opt)
   return res
 end
 
--- Preamble handshake. A relative --root is made absolute here: the daemon
--- runs in another directory (it keeps the spelling, the daemon realpaths it).
+-- Preamble handshake. A relative --root or --log is made absolute here: the
+-- daemon runs in another directory (it keeps the root's spelling and
+-- realpaths it).
 local popts = {}
 for k, v in pairs(opts) do popts[k] = v end
-if type(popts.root) == "string" and popts.root:sub(1, 1) ~= "/" then
-  local cwd = serverfs.realpath(".")
-  if cwd then popts.root = cwd .. "/" .. popts.root end
+for _, key in ipairs({ "root", "log" }) do
+  local v = popts[key]
+  if type(v) == "string" and v ~= "" and v:sub(1, 1) ~= "/" then
+    local cwd = serverfs.realpath(".")
+    if cwd then popts[key] = cwd .. "/" .. v end
+  end
 end
 local preamble = {
   ev = "relay",

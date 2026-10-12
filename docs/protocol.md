@@ -484,12 +484,18 @@ thither-server --extract-data <dir>                             -- write the bui
 * `--session <name>` runs a relay that copies stdio to a per-user session
   daemon (started on demand, `session` cap), see `docs/sessions-plan.md`.
   * The relay's first frame (`ev="relay"`: `env` a map of strings, `opts`
-    with an optional `root`) is validated; a bad one is answered with
-    `relay_ok` carrying `err={code,msg}` and that connection is closed (the
-    relay forwards it to the client as an error hello and exits 2). A
-    preamble root is resolved like `set_root`.
-  * On stdin EOF the relay still sends what it read and forwards the
-    daemon's output for up to 1 s of quiet (10 s at most), then exits 0.
+    with an optional `root`, absolute `log` and list of strings `plugins`)
+    is validated; a bad one is answered with `relay_ok` carrying
+    `err={code,msg}` and that connection is closed (the relay forwards it to
+    the client as an error hello and exits 2). A preamble root is resolved
+    like `set_root`.
+  * `--root` and `--log` are per connection: each relay's own root jails
+    its connection and its `--log` gets that connection's request log. The
+    daemon itself has no root and logs to `<state>/daemon.log`.
+  * On stdin EOF the relay still sends what it read, half-closes the socket
+    and forwards the daemon's output for at most 1 s, then exits 0. After
+    EOF the daemon finishes the requests in flight and drains their replies
+    (at most 5 s) before it closes the connection.
   * `--kill` gives up (exit 1) after 5 s without an answer.
   * The runtime and state directories must be ours, mode `0700` and not
     symlinks; an existing one with another mode is refused, not chmod'ed. The

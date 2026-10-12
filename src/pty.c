@@ -22,10 +22,20 @@
 
 extern char **environ;
 
+/* every failure returns nil, code, message: code is an errno name
+** ("ENOENT", ...; "error" when unnamed), message strerror() */
 static int push_err(lua_State *L, int err) {
   lua_pushnil(L);
+  lua_pushstring(L, server_errno_name(err));
   lua_pushstring(L, strerror(err));
-  return 2;
+  return 3;
+}
+
+static int push_einval(lua_State *L, const char *msg) {
+  lua_pushnil(L);
+  lua_pushliteral(L, "EINVAL");
+  lua_pushstring(L, msg);
+  return 3;
 }
 
 static int parse_signal(const char *name) {
@@ -105,10 +115,10 @@ static char **build_env(lua_State *L, int env_idx, int anchor, const char *term)
 }
 
 /* serverpty.open({ argv, cwd, env, cols, rows, term })
-**   -> { master = fd, pid = n } | nil, message, code
+**   -> { master = fd, pid = n } | nil, code, message
 ** argv[1] is looked up in PATH. When the child cannot start (no such program,
 ** bad cwd, ...) the errno is passed back through a close-on-exec pipe:
-** message is strerror(), code its errno name ("ENOENT", ...). The child gets
+** code is its errno name ("ENOENT", ...), message strerror(). The child gets
 ** default signal dispositions and an empty signal mask. */
 static int f_pty_open(lua_State *L) {
   luaL_checktype(L, 1, LUA_TTABLE);
@@ -120,17 +130,9 @@ static int f_pty_open(lua_State *L) {
 
   /* Extract argv */
   lua_getfield(L, 1, "argv");
-  if (!lua_istable(L, -1)) {
-    lua_pushnil(L);
-    lua_pushliteral(L, "argv must be a list of strings");
-    return 2;
-  }
+  if (!lua_istable(L, -1)) return push_einval(L, "argv must be a list of strings");
   int argc = (int) lua_rawlen(L, -1);
-  if (argc == 0) {
-    lua_pushnil(L);
-    lua_pushliteral(L, "argv cannot be empty");
-    return 2;
-  }
+  if (argc == 0) return push_einval(L, "argv cannot be empty");
   char **c_argv = lua_newuserdatauv(L, (size_t) (argc + 1) * sizeof(char *), 0);
   lua_rawseti(L, anchor, (lua_Integer) lua_rawlen(L, anchor) + 1);
   for (int i = 0; i < argc; i++) {
@@ -258,10 +260,7 @@ static int f_pty_open(lua_State *L) {
     if (nr > 0) {
       close(outpipe[0]);
       while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-      lua_pushnil(L);
-      lua_pushstring(L, strerror(child_err));
-      lua_pushstring(L, server_errno_name(child_err));
-      return 3;
+      return push_err(L, child_err);
     }
 
     fcntl(outpipe[0], F_SETFL, fcntl(outpipe[0], F_GETFL) | O_NONBLOCK);
@@ -402,10 +401,7 @@ static int f_pty_open(lua_State *L) {
   if (nr > 0) {
     close(master);
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-    lua_pushnil(L);
-    lua_pushstring(L, strerror(child_err));
-    lua_pushstring(L, server_errno_name(child_err));
-    return 3;
+    return push_err(L, child_err);
   }
 
   /* Set master PTY descriptor to non-blocking */
@@ -423,7 +419,7 @@ static int f_pty_open(lua_State *L) {
   return 1;
 }
 
-/* serverpty.resize(master_fd, cols, rows) -> true | nil, err */
+/* serverpty.resize(master_fd, cols, rows) -> true | nil, code, message */
 static int f_pty_resize(lua_State *L) {
   int fd = (int) luaL_checkinteger(L, 1);
   int cols = (int) luaL_checkinteger(L, 2);
@@ -439,7 +435,7 @@ static int f_pty_resize(lua_State *L) {
   return 1;
 }
 
-/* serverpty.reap(pid) -> exit_code, killed | nil (if running) | nil, err */
+/* serverpty.reap(pid) -> exit_code, killed | nil (if running) | nil, code, message */
 static int f_pty_reap(lua_State *L) {
   pid_t pid = (pid_t) luaL_checkinteger(L, 1);
   int status = 0;
@@ -466,16 +462,17 @@ static int f_pty_reap(lua_State *L) {
   return 2;
 }
 
-/* serverpty.signal(pid, signame, [fg_fd]) -> true | nil, err */
+/* serverpty.signal(pid_or_pgid, signame, [fg_fd]) -> true | nil, code, message
+** With a terminal fg_fd the signal goes to its foreground process group.
+** Otherwise (pipe mode, or no fg_fd) a pid that leads its own process group,
+** as every child of serverpty.open does (setsid), gets it for the whole
+** group, so that the job's children are reached too; a negative value is a
+** process group. */
 static int f_pty_signal(lua_State *L) {
   pid_t pid = (pid_t) luaL_checkinteger(L, 1);
   const char *signame = luaL_checkstring(L, 2);
   int sig = parse_signal(signame);
-  if (sig < 0) {
-    lua_pushnil(L);
-    lua_pushliteral(L, "unknown signal");
-    return 2;
-  }
+  if (sig < 0) return push_einval(L, "unknown signal");
   if (!lua_isnoneornil(L, 3)) {
     int fg_fd = (int) luaL_checkinteger(L, 3);
     pid_t pgrp = tcgetpgrp(fg_fd);
@@ -486,6 +483,10 @@ static int f_pty_signal(lua_State *L) {
       }
     }
   }
+  if (pid > 0 && getpgid(pid) == pid && kill(-pid, sig) == 0) {
+    lua_pushboolean(L, 1);
+    return 1;
+  }
   if (kill(pid, sig) != 0) {
     return push_err(L, errno);
   }
@@ -493,7 +494,7 @@ static int f_pty_signal(lua_State *L) {
   return 1;
 }
 
-/* serverpty.fg_pgrp(master_fd) -> pgrp | nil, err */
+/* serverpty.fg_pgrp(master_fd) -> pgrp | nil, code, message */
 static int f_pty_fg_pgrp(lua_State *L) {
   int fd = (int) luaL_checkinteger(L, 1);
   pid_t pgrp = tcgetpgrp(fd);

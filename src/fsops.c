@@ -538,14 +538,14 @@ static int f_ids(lua_State *L) {
   }
   free(g);
   lua_setfield(L, -2, "gids");
-  const char *u = getenv("USER");
+  /* the account of our uid; $USER/$LOGNAME (which may be inherited from
+  ** another account) only when the passwd lookup fails, e.g. in a static
+  ** build without NSS */
+  struct passwd *pw = getpwuid(getuid());
+  const char *u = pw && pw->pw_name && *pw->pw_name ? pw->pw_name : NULL;
+  if (!u) u = getenv("USER");
   if (!u || !*u) u = getenv("LOGNAME");
-  if (u && *u) {
-    lua_pushstring(L, u); lua_setfield(L, -2, "user");
-  } else {
-    struct passwd *pw = getpwuid(getuid());
-    if (pw && pw->pw_name) { lua_pushstring(L, pw->pw_name); lua_setfield(L, -2, "user"); }
-  }
+  if (u && *u) { lua_pushstring(L, u); lua_setfield(L, -2, "user"); }
   return 1;
 }
 

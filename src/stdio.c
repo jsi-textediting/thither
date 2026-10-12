@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -85,6 +86,10 @@ const char *server_errno_name(int err) {
     case EOPNOTSUPP: return "EOPNOTSUPP";
     case ETIMEDOUT: return "ETIMEDOUT";
     case EIO: return "EIO";
+    case ENOTTY: return "ENOTTY";
+    case ESRCH: return "ESRCH";
+    case ECHILD: return "ECHILD";
+    case ENXIO: return "ENXIO";
     default: return "error";
   }
 }
@@ -110,10 +115,16 @@ void server_close_fds_from(int lowfd, int keep) {
   if (ok) return;
   /* ENOSYS (kernels before 5.9): close them one by one */
 #endif
-  int maxfd = 1024;
+  /* every descriptor the process can hold: the soft limit, else the
+  ** system's OPEN_MAX (no cap, so that no high fd leaks into the child) */
+  int maxfd = -1;
   struct rlimit rl;
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
-    maxfd = rl.rlim_cur > 65536 ? 65536 : (int) rl.rlim_cur;
+    maxfd = rl.rlim_cur > (rlim_t) INT_MAX ? INT_MAX : (int) rl.rlim_cur;
+  if (maxfd < 0) {
+    long om = sysconf(_SC_OPEN_MAX);
+    maxfd = om > 0 ? (om > INT_MAX ? INT_MAX : (int) om) : 65536;
+  }
   for (int fd = lowfd; fd < maxfd; fd++)
     if (fd != keep) close(fd);
 }
@@ -473,7 +484,9 @@ static int f_poll(lua_State *L) {
     lua_pop(L, 1);
   }
   if (count == 0) {
-    if (timeout > 0) usleep((useconds_t) timeout * 1000);
+    /* nothing to watch: just wait (forever for nil), but a signal still
+    ** ends the wait early (EINTR) as it does with descriptors */
+    if (timeout != 0) poll(NULL, 0, timeout);
     lua_newtable(L);
     return 1;
   }
@@ -743,6 +756,8 @@ static int f_is_ready(lua_State *L) {
 
 extern char **environ;
 
+/* serverio.shutdown(fd, how) -> true | nil, code, message
+** how: "r", "w" (default) or "rw". */
 static int f_shutdown(lua_State *L) {
   int fd = (int) luaL_checkinteger(L, 1);
   const char *how_str = luaL_optstring(L, 2, "w");
@@ -753,9 +768,10 @@ static int f_shutdown(lua_State *L) {
     return luaL_error(L, "invalid shutdown mode '%s' (expected 'r', 'w', or 'rw')", how_str);
   }
   if (shutdown(fd, how) < 0) {
+    int err = errno; /* before any Lua call, which may run finalizers */
     lua_pushnil(L);
-    lua_pushstring(L, strerror(errno));
-    lua_pushstring(L, server_errno_name(errno));
+    lua_pushstring(L, server_errno_name(err));
+    lua_pushstring(L, strerror(err));
     return 3;
   }
   lua_pushboolean(L, 1);

@@ -144,20 +144,27 @@ return function(server)
     return true
   end
 
+  --- A path whose final component the op replaces or removes: jailed by its
+  --- parent (server.path nofollow), and never the jail root itself.
+  local function entry_path(p, what)
+    local path = server.path(p, true)
+    if server.is_root(path) then raise("jail", "cannot " .. what .. " the server root") end
+    return path
+  end
+
   -- server.path has folded "." / ".." / "//": the only path that names no
   -- directory entry is "/" (serverfs.remove refuses it as well)
   ops.remove = function(a)
     local path = server.path(a.path, true)
     if path == "/" then raise("EINVAL", "refusing to remove the filesystem root") end
-    local root = server.root_of()
-    if root and path == root then raise("jail", "cannot remove the server root") end
+    if server.is_root(path) then raise("jail", "cannot remove the server root") end
     unwrap(serverfs.remove(path, a.recursive and true or false))
     return true
   end
 
   -- args: from, to, overwrite (default true)
   ops.rename = function(a)
-    local from, to = server.path(a.from, true), server.path(a.to, true)
+    local from, to = entry_path(a.from, "rename"), entry_path(a.to, "replace")
     unwrap(serverfs.rename(from, to, a.overwrite == false))
     return true
   end
@@ -177,13 +184,13 @@ return function(server)
   -- args: target (the link's content, not a path the server resolves), path, overwrite
   ops.symlink = function(a)
     if type(a.target) ~= "string" or a.target == "" then raise("bad_request", "target required") end
-    unwrap(serverfs.symlink(a.target, server.path(a.path, true), a.overwrite and true or false))
+    unwrap(serverfs.symlink(a.target, entry_path(a.path, "replace"), a.overwrite and true or false))
     return true
   end
 
   -- args: from, to, overwrite (hard link)
   ops.link = function(a)
-    local from, to = server.path(a.from), server.path(a.to, true)
+    local from, to = server.path(a.from), entry_path(a.to, "replace")
     unwrap(serverfs.link(from, to, a.overwrite and true or false))
     return true
   end

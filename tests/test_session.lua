@@ -319,26 +319,36 @@ H.test("session: a bad relay preamble is refused, the daemon survives", function
   local pid = rep.session.daemon_pid
   local sock = sock_of(sname)
   for _, case in ipairs({
-    { "symlink root pointing out of the jail", { opts = { root = root .. "/escape" } }, "jail" },
     { "relative root", { opts = { root = "sub" } }, "bad_path" },
-    { "root outside the jail", { opts = { root = dir .. "/outside" } }, "jail" },
     { "missing root", { opts = { root = root .. "/nope" } }, "ENOENT" },
     { "root that is a file", { opts = { root = root .. "/file" } }, "ENOTDIR" },
     { "non-table env", { env = "SSH_AUTH_SOCK=x" }, "bad_request" },
     { "non-string env value", { env = { TERM = 1 } }, "bad_request" },
     { "non-table opts", { opts = "x" }, "bad_request" },
     { "non-string root", { opts = { root = 5 } }, "bad_request" },
+    { "non-string log", { opts = { log = 5 } }, "bad_request" },
+    { "relative log", { opts = { log = "req.log" } }, "bad_request" },
+    { "non-table plugins", { opts = { plugins = "x" } }, "bad_request" },
+    { "plugins with a table in it", { opts = { plugins = { {} } } }, "bad_request" },
+    { "plugins with a boolean in it", { opts = { plugins = { true } } }, "bad_request" },
+    { "sparse plugins", { opts = { plugins = { "a", [3] = "c" } } }, "bad_request" },
+    { "non-string relay_version", { relay_version = 5 }, "bad_request" },
+    { "non-string build_id", { build_id = {} }, "bad_request" },
   }) do
     local m = raw_preamble(sock, case[2])
     H.ok(m and m.ev == "relay_ok" and m.err, case[1] .. ": expected an error relay_ok")
-    H.eq(m.err.code, case[3], case[1])
+    H.eq(m and m.err and m.err.code, case[3], case[1])
     H.ok(alive(pid), case[1] .. ": the daemon died")
   end
+  -- the first relay's --root is its own jail, not the daemon's: a root
+  -- outside it (also through a symlink) is fine for another connection
+  local m = raw_preamble(sock, { opts = { root = root .. "/escape" } })
+  H.ok(m and m.ev == "relay_ok" and not m.err, "a root outside the first relay's: " .. tostring(m and m.err and m.err.code))
   -- through a real relay: the client gets an error hello, the relay exits 2
-  local bad = Client.spawn({ args = { "--session", sname, "--root", dir .. "/outside" } })
+  local bad = Client.spawn({ args = { "--session", sname, "--root", root .. "/nope" } })
   local hello = bad:hello()
   H.ok(hello and hello.ev == "hello" and hello.err, "error hello from a refused relay")
-  H.eq(hello.err.code, "jail")
+  H.eq(hello and hello.err and hello.err.code, "ENOENT")
   H.eq(bad:wait_exit(5), 2)
   -- a good relay still works, on the same daemon
   local c2, rep2 = Client.connect({ args = { "--session", sname, "--root", root .. "/sub" } })
@@ -404,13 +414,68 @@ H.test("session: set_root records a per-connection project root and does not jai
   shutdown(c, rep.session.daemon_pid)
 end)
 
-H.test("session: --root through a symlink (preamble and daemon root)", function()
+H.test("session: --root through a symlink (per-connection preamble root)", function()
   local dir, spelled, real = symlinked_tree("proot")
   local sname = sname_of("symroot")
   local c, rep = Client.connect({ args = { "--session", sname, "--root", spelled } })
   H.eq(rep.root, real)
   check_symlinked_root(c, dir, spelled, real)
+  -- the root in its symlinked spelling can be stat'ed without following
+  H.eq(c:request("stat", { path = spelled, nofollow = true }).type, "dir", "stat{nofollow} of the spelled root")
+  H.eq(c:request("stat", { path = real, nofollow = true }).type, "dir", "stat{nofollow} of the real root")
+  for _, op in ipairs({
+    { "rename", { from = spelled, to = spelled .. "/sub/moved" } },
+    { "symlink", { target = "/tmp", path = spelled, overwrite = true } },
+  }) do
+    local _, err = c:request(op[1], op[2])
+    H.eq(err and err.code, "jail", op[1] .. " of the spelled root")
+  end
+  H.ok(U.exists(real .. "/sub/a.txt"), "the root is still there")
   shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: --root and --log are per connection, not inherited from the first relay", function()
+  local dir = U.tmpdir("multiroot")
+  U.sh("mkdir -p " .. U.shq(dir .. "/a") .. " " .. U.shq(dir .. "/b"))
+  U.write_file(dir .. "/a/fa.txt", "a")
+  U.write_file(dir .. "/b/fb.txt", "bb")
+  local ra, rb = serverfs.realpath(dir .. "/a"), serverfs.realpath(dir .. "/b")
+  local sname = sname_of("multiroot")
+  local statedir = assert(session.state_dir(sname))
+  os.remove(session.daemon_log(statedir))
+  local loga = dir .. "/a.log"
+  -- the first relay starts the daemon
+  local c1, rep1 = Client.connect({ args = { "--session", sname, "--root", ra, "--log", loga } })
+  local pid = rep1.session.daemon_pid
+  H.eq(rep1.root, ra)
+  -- a second relay with another root, outside the first one's
+  local c2, rep2 = Client.connect({ args = { "--session", sname, "--root", rb } })
+  H.eq(rep2.session.daemon_pid, pid, "same daemon")
+  H.eq(rep2.root, rb)
+  H.eq(c2:request("stat", { path = rb .. "/fb.txt" }).size, 2)
+  local _, err = c2:request("stat", { path = ra .. "/fa.txt" })
+  H.eq(err and err.code, "jail", "the second relay is jailed to its own root")
+  _, err = c1:request("stat", { path = rb .. "/fb.txt" })
+  H.eq(err and err.code, "jail", "the first relay keeps its root")
+  -- a third relay without --root is not jailed at all
+  local c3, rep3 = Client.connect({ args = { "--session", sname } })
+  H.eq(rep3.session.daemon_pid, pid, "same daemon")
+  H.eq(rep3.root, nil, "no jail inherited from the first relay")
+  H.eq(c3:request("info").root, nil)
+  H.eq(c3:request("stat", { path = ra .. "/fa.txt" }).size, 1)
+  H.eq(c3:request("stat", { path = rb .. "/fb.txt" }).size, 2)
+  H.ok(c3:request("host_info"))
+  c2:close()
+  c3:close()
+  shutdown(c1, pid)
+  -- the first relay's --log is its request log only, the daemon logs to its
+  -- state directory
+  local la = U.read_file(loga) or ""
+  H.ok(la:find("req %d+ stat"), "the first relay's requests in its log:\n" .. la)
+  H.ok(not la:find("host_info", 1, true), "another connection's requests in the first relay's log:\n" .. la)
+  H.ok(not la:find("accepted connection", 1, true), "daemon log lines in a request log:\n" .. la)
+  local dl = U.read_file(session.daemon_log(statedir)) or ""
+  H.ok(dl:find("accepted connection", 1, true), "the daemon log is in the state dir:\n" .. dl)
 end)
 
 H.test("session: an attached idle relay does not spin", function()
@@ -426,6 +491,32 @@ H.test("session: an attached idle relay does not spin", function()
   H.ok(used < CLK_TCK // 10, string.format("relay used %d ticks in 2 s while idle", used))
   H.ok(dused < CLK_TCK // 10, string.format("daemon used %d ticks in 2 s while idle", dused))
   shutdown(c, rep.session.daemon_pid)
+end)
+
+H.test("session: relay stdin EOF still delivers large and async replies in flight", function()
+  local dir = U.tmpdir("relayeof2")
+  local path = dir .. "/f"
+  local MB = 1024 * 1024
+  U.sh("yes 'a line for the relay stdin eof test' | head -c " .. (8 * MB) .. " > " .. U.shq(path))
+  local sname = sname_of("relayeof2")
+  local c0, rep = Client.connect({ args = { "--session", sname } })
+  local c = Client.spawn({ args = { "--session", sname } })
+  c:send({ ev = "hello", proto_version = 1, client_version = "tests", caps = {} })
+  -- a reply far larger than the socket buffer, and a job that yields
+  c:send({ id = 1, op = "read", args = { path = path, offset = 0, len = 4 * MB } })
+  c:send({ id = 2, op = "lineindex", args = { path = path, chunk_size = 65536 } })
+  c.proc:close_stream(process.STREAM_STDIN)
+  H.eq(c:wait_exit(10), 0, "relay exit status")
+  local got = {}
+  for _ = 1, 3 do
+    local m = c:recv(1)
+    if m then got[m.id or m.ev] = m end
+  end
+  H.ok(got.hello, "hello reply")
+  H.ok(got[1] and got[1].ok and #got[1].ok.data == 4 * MB,
+    "the whole read reply: " .. tostring(got[1] and (got[1].err and got[1].err.code or #got[1].ok.data)))
+  H.ok(got[2] and got[2].ok, "the lineindex reply: " .. tostring(got[2] and got[2].err and got[2].err.code))
+  shutdown(c0, rep.session.daemon_pid)
 end)
 
 H.test("session: relay stdin EOF still delivers the replies in flight", function()
@@ -547,6 +638,8 @@ H.test("session: per-connection --log writes request log", function()
   local content = U.read_file(logfile)
   H.ok(content and content:find("req %d+ ping"), "per-connection log should contain ping request: " .. tostring(content))
   H.ok(content:find("rep %d+ ok"), "per-connection log should contain ping reply: " .. tostring(content))
+  -- a request log, not the daemon log (that stays in the state dir)
+  H.ok(not content:find("accepted connection", 1, true), "daemon log lines in the request log: " .. content)
 end)
 
 H.test("session: plugin mismatch reported in relay_ok", function()
@@ -558,9 +651,19 @@ H.test("session: plugin mismatch reported in relay_ok", function()
     build_id = "differ123456",
     opts = { plugins = { "/custom/plugin/path" } }
   })
-  H.ok(msg and msg.ev == "relay_ok", "relay_ok response")
+  H.ok(msg and msg.ev == "relay_ok" and not msg.err, "relay_ok response")
   H.eq(type(msg.daemon_plugins), "table")
   H.ok(msg.daemon_build ~= nil)
+  -- the daemon logs the mismatch
+  local dlog = U.read_file(session.daemon_log(assert(session.state_dir(sname)))) or ""
+  H.ok(dlog:find("differ from daemon plugins", 1, true), "mismatch in the daemon log:\n" .. dlog)
+  -- and a real relay asking for other plugins warns on its stderr
+  local plugdir = U.tmpdir("noplug")
+  local c2 = Client.connect({ args = { "--session", sname, "--plugins", plugdir } })
+  H.eq(c2:request("ping", { data = 1 }), 1)
+  c2:pump()
+  H.ok(c2.stderr:find("session plugins differ", 1, true), "relay warning: " .. c2.stderr)
+  c2:close()
   shutdown(c, rep.session.daemon_pid)
 end)
 
@@ -604,38 +707,77 @@ H.test("session: version skew includes build_id in hello session table", functio
 end)
 
 H.test("session: extended environment subset and --forward-env forwarded", function()
+  -- a plugin that shows the daemon's view of the connection's environment
+  local plugdir = U.tmpdir("envplug")
+  U.write_file(plugdir .. "/envdump.lua", [[
+local server = require "thither"
+server.register("envdump", { env = function(_, req) return req.conn and req.conn.env or {} end })
+]])
+  local env = {
+    DISPLAY = ":99",
+    WAYLAND_DISPLAY = "wayland-9",
+    COLORTERM = "truecolor",
+    TERM = "xterm-test",
+    LANG = "C.UTF-8",
+    LC_MESSAGES = "C.UTF-8",
+    SSH_CONNECTION = "1.2.3.4 5 6.7.8.9 22",
+    MY_CUSTOM_VAR = "custom_value",
+    PREFIX_FOO = "foo_val",
+    PREFIXNOT = "not forwarded",
+    MY_CUSTOM_VAR2 = "not forwarded",
+    IGNORED_SECRET = "secret",
+  }
+  -- what the relay and the daemon need to find their directories
+  for _, k in ipairs({ "PATH", "HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME" }) do
+    env[k] = os.getenv(k)
+  end
   local sname = sname_of("ext_env")
   local c, rep = Client.connect({
-    args = { "--session", sname, "--forward-env", "MY_CUSTOM_VAR,PREFIX_*" },
-    env = {
-      DISPLAY = ":99",
-      COLORTERM = "truecolor",
-      LC_MESSAGES = "C.UTF-8",
-      MY_CUSTOM_VAR = "custom_value",
-      PREFIX_FOO = "foo_val",
-      IGNORED_SECRET = "secret",
-    }
+    args = { "--session", sname, "--plugins", plugdir, "--forward-env", "MY_CUSTOM_VAR, PREFIX_*" },
+    env = env,
   })
-  H.ok(rep and rep.ev == "hello")
+  local got = c:request("call", { service = "envdump", method = "env" })
+  H.ok(type(got) == "table", "envdump: " .. tostring(got))
+  for _, k in ipairs({ "DISPLAY", "WAYLAND_DISPLAY", "COLORTERM", "TERM", "LANG", "LC_MESSAGES",
+                       "SSH_CONNECTION", "MY_CUSTOM_VAR", "PREFIX_FOO" }) do
+    H.eq(got[k], env[k], "forwarded: " .. k)
+  end
+  for _, k in ipairs({ "PREFIXNOT", "MY_CUSTOM_VAR2", "IGNORED_SECRET", "PATH", "HOME" }) do
+    H.eq(got[k], nil, "not forwarded: " .. k)
+  end
   shutdown(c, rep.session.daemon_pid)
 end)
 
-H.test("session: runtime and state dirs work with USER and HOME set without NSS", function()
-  local uid = serverfs.ids().uid
-  local rdir, rerr = session.runtime_dir()
-  H.ok(rdir, "runtime dir: " .. tostring(rerr))
-  local sdir, serr = session.state_dir("test_nss_sess")
-  H.ok(sdir, "state dir: " .. tostring(serr))
-  H.ok(serverfs.ids().user ~= nil, "user name should be present")
+H.test("session: runtime and state dirs come from XDG_RUNTIME_DIR / XDG_STATE_HOME without HOME or USER", function()
+  local base = U.tmpdir("xdgdirs")
+  local sname = sname_of("xdg")
+  local c, rep = Client.connect({ args = { "--session", sname }, env = {
+    PATH = os.getenv("PATH") or "/usr/bin:/bin",
+    XDG_RUNTIME_DIR = base .. "/run",
+    XDG_STATE_HOME = base .. "/state",
+  } })
+  H.eq(c:request("ping", { data = "x" }), "x")
+  local st = serverfs.stat(base .. "/run/thither-server/" .. sname .. ".sock", true)
+  H.ok(st and st.type == "socket", "the socket is under $XDG_RUNTIME_DIR")
+  H.eq(serverfs.stat(base .. "/run/thither-server", true).mode % 512, 448, "runtime dir is 0700")
+  H.ok(U.exists(base .. "/state/thither-server/" .. sname .. "/daemon.log"), "the daemon log is under $XDG_STATE_HOME")
+  shutdown(c, rep.session.daemon_pid)
 end)
 
 H.test("session: relay half-close completes within 1s after stdin EOF", function()
   local sname = sname_of("halfclose")
+  local c0, rep = Client.connect({ args = { "--session", sname } })
+  local c = Client.spawn({ args = { "--session", sname } })
+  local hello = c:hello()
+  H.ok(hello and hello.ev == "hello" and not hello.err, "hello")
   local t0 = system.get_time()
-  local out, code = U.sh("echo '' | ./build/thither-server --datadir lua --session " .. sname)
+  c.proc:close_stream(process.STREAM_STDIN)
+  local code = c:wait_exit(5)
   local elapsed = system.get_time() - t0
-  H.ok(elapsed <= 2.5, "relay should exit within bounded timeout after stdin EOF, took " .. elapsed .. "s")
-  U.sh("./build/thither-server --session " .. sname .. " --kill")
+  H.eq(code, 0, "relay exit status")
+  H.ok(elapsed <= 2.5, string.format("relay should exit within a bounded time after stdin EOF, took %.2f s", elapsed))
+  H.eq(c0:request("session_info").connections, 1, "the daemon dropped the half-closed connection")
+  shutdown(c0, rep.session.daemon_pid)
 end)
 
 H.test("session: accept error back-off on EMFILE pauses listener", function()
@@ -646,18 +788,29 @@ H.test("session: accept error back-off on EMFILE pauses listener", function()
   local logpath = session.daemon_log(statedir)
 
   -- Count current fds of daemon
-  local fds = U.sh("ls -1 /proc/" .. pid .. "/fd | wc -l")
-  local num_fds = tonumber(fds:match("%d+"))
-  if num_fds then
-    U.sh(string.format("prlimit --pid %d --nofile=%d:%d", pid, num_fds, num_fds))
-    local c2 = Client.spawn({ args = { "--session", sname } })
-    system.sleep(0.2)
-    U.sh(string.format("prlimit --pid %d --nofile=1024:1024", pid))
-    system.sleep(0.2)
-    local log = U.read_file(logpath)
-    H.ok(log and log:find("accept failed"), "daemon should log accept failure: " .. tostring(log))
-    c2:close()
+  local fds, lscode = U.sh("ls -1 /proc/" .. pid .. "/fd | wc -l")
+  local num_fds = lscode == 0 and tonumber(fds:match("%d+"))
+  local _, pcode = U.sh("command -v prlimit")
+  local orig = pcode == 0 and (U.sh("prlimit --pid " .. pid .. " --nofile --output=SOFT --noheadings")):match("%S+")
+  if not num_fds or num_fds == 0 or not orig then
+    shutdown(c, pid)
+    print("     (skipped: needs /proc and prlimit)")
+    return
   end
+  -- lower only the soft limit: raising a hard limit back needs privileges
+  local _, lcode = U.sh(string.format("prlimit --pid %d --nofile=%d:", pid, num_fds))
+  H.eq(lcode, 0, "prlimit lowering the soft limit")
+  local c2 = Client.spawn({ args = { "--session", sname } })
+  system.sleep(0.3)
+  local log = U.read_file(logpath)
+  H.ok(log and log:find("accept failed"), "daemon should log accept failure: " .. tostring(log))
+  H.eq(c:request("ping", { data = "busy" }, 5), "busy", "the open connection is still served")
+  local _, rcode = U.sh(string.format("prlimit --pid %d --nofile=%s:", pid, orig))
+  H.eq(rcode, 0, "prlimit restoring the soft limit")
+  -- once descriptors are available again the waiting relay gets through
+  local hello = c2:hello()
+  H.ok(hello and hello.ev == "hello" and not hello.err, "the waiting relay is served after the back-off: " .. c2.stderr)
+  c2:close()
   shutdown(c, pid)
 end)
 

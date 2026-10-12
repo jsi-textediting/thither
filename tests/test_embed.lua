@@ -39,7 +39,7 @@ H.test("embed: the server modules are compiled in and --version shows the build 
 end)
 
 H.test("embed: embedded files are the lua/ sources with LF line ends", function()
-  if not embedded() then return end
+  if not embedded() or not DATADIR then return end  -- compares against lua/
   for _, p in ipairs(server_files()) do
     local disk = U.read_file(DATADIR .. "/" .. p)
     H.ok(disk, "missing in lua/: " .. p)
@@ -81,7 +81,7 @@ H.test("embed: a stale lua directory next to the binary is ignored", function()
 end)
 
 H.test("embed: --datadir overrides the embedded modules, missing ones fall back", function()
-  if not embedded() then return end
+  if not embedded() or not DATADIR then return end  -- patches lua/thither/init.lua
   local exe = lone_server()
   -- a data directory with only a patched thither/init.lua: the other modules
   -- must come from the binary

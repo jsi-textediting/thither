@@ -107,16 +107,21 @@ local function wait_exit(pid)
 end
 
 H.test("serverpty: open of a missing program reports the exec failure", function()
-  local res, err, code = serverpty.open({ argv = { "/nonexistent/thither-no-such-prog" } })
+  local res, code, err = serverpty.open({ argv = { "/nonexistent/thither-no-such-prog" } })
   H.eq(res, nil)
   H.eq(code, "ENOENT")
   H.ok(type(err) == "string" and #err > 0)
 
-  res, err, code = serverpty.open({ argv = { "thither-no-such-prog-in-path" } })
+  res, code, err = serverpty.open({ argv = { "thither-no-such-prog-in-path" } })
   H.eq(res, nil)
   H.eq(code, "ENOENT")
 
-  res, err, code = serverpty.open({ argv = { "sh", "-c", "true" }, cwd = "/nonexistent/dir" })
+  res, code, err = serverpty.open({ argv = {} })
+  H.eq(res, nil)
+  H.eq(code, "EINVAL")
+  H.ok(type(err) == "string" and #err > 0)
+
+  res, code, err = serverpty.open({ argv = { "sh", "-c", "true" }, cwd = "/nonexistent/dir" })
   H.eq(res, nil)
   H.eq(code, "ENOENT")
 end)
@@ -186,9 +191,10 @@ H.test("serverpty: pipe mode (tty=false) merges stdout and stderr", function()
   H.ok(out:find("from_stderr"), "should contain stderr: " .. tostring(out))
 
   -- Resize on a pipe descriptor fails
-  local r_ok, r_err = serverpty.resize(res.master, 100, 30)
+  local r_ok, r_code, r_err = serverpty.resize(res.master, 100, 30)
   H.eq(r_ok, nil, "resize on pipe should fail")
-  H.ok(r_err ~= nil)
+  H.eq(r_code, "ENOTTY")
+  H.ok(type(r_err) == "string" and #r_err > 0)
 
   H.eq(wait_exit(res.pid), 0)
   serverio.close(res.master)
@@ -204,5 +210,36 @@ H.test("serverpty: pipe mode process group receives signal", function()
   local code, killed = wait_exit(res.pid)
   H.ok(code == 143 or killed == true, "child should be terminated by signal")
   serverio.close(res.master)
+end)
+
+H.test("serverpty: pipe mode signal reaches the whole job", function()
+  -- sh forks sleep (it does not exec it: a command follows), so signalling
+  -- only sh would leave sleep holding the output pipe open for 100 s
+  local res = serverpty.open({
+    argv = { "sh", "-c", 'sleep 100; echo done' },
+    tty = false,
+  })
+  H.ok(res)
+  system.sleep(0.2) -- let sh start sleep
+  H.ok(serverpty.signal(res.pid, "term"))
+  local code, killed = wait_exit(res.pid)
+  H.ok(code == 143 or killed == true, "sh should be terminated by signal")
+  -- EOF on the pipe once every member of the group is gone
+  local out, eof = "", false
+  local deadline = system.get_time() + 5
+  while system.get_time() < deadline do
+    serverio.poll({ [res.master] = "r" }, 100)
+    local data = serverio.read(4096, res.master)
+    if data == nil then eof = true break end
+    out = out .. data
+  end
+  H.ok(eof, "the job's children should be gone (pipe EOF), got: " .. out)
+  H.ok(not out:find("done", 1, true), "the job should not finish: " .. out)
+  serverio.close(res.master)
+
+  -- an unknown signal name is EINVAL
+  local ok, scode = serverpty.signal(res.pid, "nosuchsignal")
+  H.eq(ok, nil)
+  H.eq(scode, "EINVAL")
 end)
 
